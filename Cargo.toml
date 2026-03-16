@@ -2,6 +2,11 @@
 name = "forever-ago"
 version = "0.1.0"
 edition = "2024"
+description = "Nightly tar.gz backups of a directory with SHA-256 verification and retention pruning"
+license = "MIT"
+repository = "https://github.com/delorenj/forever-ago"
+homepage = "https://github.com/delorenj/forever-ago"
+documentation = "https://docs.rs/forever-ago"
 
 [dependencies]
 anyhow = "1.0.97"
