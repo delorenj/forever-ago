@@ -1,5 +1,5 @@
 use anyhow::{anyhow, bail, Context, Result};
-use chrono::{DateTime, Local, NaiveDate, NaiveTime, TimeZone};
+use chrono::{DateTime, Datelike, Local, NaiveDate, NaiveTime, TimeZone};
 use clap::Parser;
 use flate2::write::GzEncoder;
 use flate2::Compression;
@@ -10,6 +10,7 @@ use std::ffi::OsStr;
 use std::fs;
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Read, Write};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -53,6 +54,46 @@ struct Cli {
     /// In daemon mode: run a backup immediately on startup, then continue nightly.
     #[arg(long)]
     run_now: bool,
+
+    /// GFS retention: how many recent daily backups to keep. Implies GFS mode.
+    #[arg(long)]
+    keep_daily: Option<usize>,
+
+    /// GFS retention: how many weekly backups to keep (newest in each ISO week). Implies GFS mode.
+    #[arg(long)]
+    keep_weekly: Option<usize>,
+
+    /// GFS retention: how many monthly backups to keep (newest in each month). Implies GFS mode.
+    #[arg(long)]
+    keep_monthly: Option<usize>,
+
+    /// Exclude paths from the archive. Repeatable.
+    ///
+    /// Three forms, matched against each entry's path RELATIVE to the source root:
+    ///   `name`      -> excludes any path component equal to `name` (e.g. `.venv`, `node_modules`)
+    ///   `*.ext`     -> excludes files with that extension (e.g. `*.pyc`)
+    ///   `a/b/c`     -> excludes that relative subtree (prefix match)
+    /// Excluding a directory prunes the whole subtree — its children are never walked.
+    #[arg(long = "exclude")]
+    excludes: Vec<String>,
+
+    /// Read additional --exclude patterns from a file, one per line (`#` comments allowed).
+    #[arg(long)]
+    exclude_from: Option<PathBuf>,
+}
+
+/// How many backups to keep, and by what rule.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RetentionPolicy {
+    /// Flat rolling window: keep the newest N, delete the rest.
+    Count(usize),
+    /// Grandfather-father-son: keep N recent dailies, plus the newest backup in
+    /// each of the last N ISO weeks, plus the newest in each of the last N months.
+    Gfs {
+        daily: usize,
+        weekly: usize,
+        monthly: usize,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -61,7 +102,8 @@ struct Config {
     dest_dir: PathBuf,
     prefix: String,
     at: NaiveTime,
-    retain_count: usize,
+    retention: RetentionPolicy,
+    excludes: Vec<ExcludePattern>,
 }
 
 fn main() -> Result<()> {
@@ -79,13 +121,57 @@ fn main() -> Result<()> {
         None => default_backup_dir()?,
     };
 
+    // Any --keep-* flag switches to GFS; unset tiers fall back to 7/4/4 so a
+    // partial invocation still yields a sane ladder. Plain --retain keeps
+    // working untouched, so existing deployments do not change behaviour.
+    let retention = if cli.keep_daily.is_some()
+        || cli.keep_weekly.is_some()
+        || cli.keep_monthly.is_some()
+    {
+        RetentionPolicy::Gfs {
+            daily: cli.keep_daily.unwrap_or(7),
+            weekly: cli.keep_weekly.unwrap_or(4),
+            monthly: cli.keep_monthly.unwrap_or(4),
+        }
+    } else {
+        RetentionPolicy::Count(cli.retain)
+    };
+
+    let mut exclude_strings = cli.excludes.clone();
+    if let Some(path) = &cli.exclude_from {
+        let path = abs_path(&expand_tilde(path)?)?;
+        let text = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read --exclude-from file {}", path.display()))?;
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            exclude_strings.push(line.to_string());
+        }
+    }
+    let excludes: Vec<ExcludePattern> =
+        exclude_strings.iter().map(|p| ExcludePattern::parse(p)).collect();
+
     let cfg = Config {
         source_dir,
         dest_dir,
         prefix: cli.prefix,
         at,
-        retain_count: cli.retain,
+        retention,
+        excludes,
     };
+
+    match &cfg.retention {
+        RetentionPolicy::Count(n) => log("INFO", format!("retention: keep newest {n}")),
+        RetentionPolicy::Gfs { daily, weekly, monthly } => log(
+            "INFO",
+            format!("retention: GFS {daily} daily / {weekly} weekly / {monthly} monthly"),
+        ),
+    }
+    if !cfg.excludes.is_empty() {
+        log("INFO", format!("{} exclude pattern(s) active", cfg.excludes.len()));
+    }
 
     fs::create_dir_all(&cfg.dest_dir).with_context(|| {
         format!(
@@ -262,7 +348,7 @@ fn run_backup(cfg: &Config) -> Result<()> {
         ),
     );
 
-    let (sha_bytes, bytes_written) = write_tar_gz(&cfg.source_dir, &tmp_path)?;
+    let (sha_bytes, bytes_written) = write_tar_gz(&cfg.source_dir, &tmp_path, &cfg.excludes)?;
     let sha_hex = hex::encode(sha_bytes);
 
     // Verify by re-hashing the written file and comparing to the hash computed while writing.
@@ -309,7 +395,119 @@ fn run_backup(cfg: &Config) -> Result<()> {
     Ok(())
 }
 
-fn write_tar_gz(source_dir: &Path, out_path: &Path) -> Result<([u8; 32], u64)> {
+/// A single --exclude rule. Deliberately not a full glob engine: these three
+/// shapes cover everything a backup scope needs, and a predictable matcher is
+/// worth more here than an expressive one you have to reason about at 3am.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ExcludePattern {
+    /// `.venv` — any path component with this exact name.
+    Component(String),
+    /// `*.pyc` — any file with this extension.
+    Extension(String),
+    /// `a/b/c` — this relative subtree.
+    Prefix(PathBuf),
+}
+
+impl ExcludePattern {
+    fn parse(raw: &str) -> Self {
+        let raw = raw.trim().trim_end_matches('/');
+        if let Some(ext) = raw.strip_prefix("*.") {
+            ExcludePattern::Extension(ext.to_ascii_lowercase())
+        } else if raw.contains('/') {
+            ExcludePattern::Prefix(PathBuf::from(raw))
+        } else {
+            ExcludePattern::Component(raw.to_string())
+        }
+    }
+
+    /// `rel` is the path relative to the source root.
+    fn matches(&self, rel: &Path) -> bool {
+        match self {
+            ExcludePattern::Component(name) => rel
+                .components()
+                .any(|c| c.as_os_str().to_string_lossy() == name.as_str()),
+            ExcludePattern::Extension(ext) => rel
+                .extension()
+                .map(|e| e.to_string_lossy().to_ascii_lowercase() == *ext)
+                .unwrap_or(false),
+            ExcludePattern::Prefix(prefix) => rel.starts_with(prefix),
+        }
+    }
+}
+
+fn is_excluded(rel: &Path, patterns: &[ExcludePattern]) -> bool {
+    patterns.iter().any(|p| p.matches(rel))
+}
+
+/// Walk `dir` and append everything not excluded. Excluded directories are
+/// pruned, not merely skipped, so we never pay to descend into a 495 MB
+/// .stversions tree just to drop each file individually.
+fn append_filtered<W: Write>(
+    tar: &mut tar::Builder<W>,
+    source_root: &Path,
+    dir: &Path,
+    root_name: &str,
+    excludes: &[ExcludePattern],
+    stats: &mut ArchiveStats,
+) -> Result<()> {
+    let mut entries: Vec<_> = fs::read_dir(dir)
+        .with_context(|| format!("failed to read {}", dir.display()))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    // Deterministic order: two runs over an unchanged tree produce identical tars.
+    entries.sort_by_key(|e| e.file_name());
+
+    for entry in entries {
+        let path = entry.path();
+        let rel = match path.strip_prefix(source_root) {
+            Ok(r) => r.to_path_buf(),
+            Err(_) => continue,
+        };
+        if is_excluded(&rel, excludes) {
+            stats.excluded += 1;
+            continue;
+        }
+
+        let ft = entry.file_type()?;
+        let name_in_tar = Path::new(root_name).join(&rel);
+
+        if ft.is_dir() {
+            tar.append_dir(&name_in_tar, &path)
+                .with_context(|| format!("failed to archive dir {}", path.display()))?;
+            append_filtered(tar, source_root, &path, root_name, excludes, stats)?;
+        } else if ft.is_symlink() {
+            let mut header = tar::Header::new_gnu();
+            let meta = fs::symlink_metadata(&path)?;
+            header.set_metadata(&meta);
+            header.set_entry_type(tar::EntryType::Symlink);
+            let target = fs::read_link(&path)?;
+            tar.append_link(&mut header, &name_in_tar, &target)
+                .with_context(|| format!("failed to archive symlink {}", path.display()))?;
+            stats.included += 1;
+        } else if ft.is_file() {
+            let mut f = File::open(&path)
+                .with_context(|| format!("failed to open {}", path.display()))?;
+            tar.append_file(&name_in_tar, &mut f)
+                .with_context(|| format!("failed to archive file {}", path.display()))?;
+            stats.included += 1;
+            stats.bytes += entry.metadata().map(|m| m.len()).unwrap_or(0);
+        }
+        // Anything else (sockets, fifos) is deliberately skipped.
+    }
+    Ok(())
+}
+
+#[derive(Default, Debug)]
+struct ArchiveStats {
+    included: u64,
+    excluded: u64,
+    bytes: u64,
+}
+
+fn write_tar_gz(
+    source_dir: &Path,
+    out_path: &Path,
+    excludes: &[ExcludePattern],
+) -> Result<([u8; 32], u64)> {
     let out_file = File::create(out_path)
         .with_context(|| format!("failed to create output file {}", out_path.display()))?;
     let buf = BufWriter::new(out_file);
@@ -323,12 +521,28 @@ fn write_tar_gz(source_dir: &Path, out_path: &Path) -> Result<([u8; 32], u64)> {
         .file_name()
         .and_then(OsStr::to_str)
         .unwrap();
-    tar.append_dir_all(root_name, source_dir).with_context(|| {
-        format!(
-            "failed to archive source directory {}",
-            source_dir.display()
-        )
-    })?;
+
+    let mut stats = ArchiveStats::default();
+    if excludes.is_empty() {
+        tar.append_dir_all(root_name, source_dir).with_context(|| {
+            format!(
+                "failed to archive source directory {}",
+                source_dir.display()
+            )
+        })?;
+    } else {
+        append_filtered(&mut tar, source_dir, source_dir, root_name, excludes, &mut stats)?;
+        log(
+            "INFO",
+            format!(
+                "archived {} entries ({:.1} MB on disk); {} path(s) excluded \
+                 (a pruned directory counts once, with its whole subtree)",
+                stats.included,
+                stats.bytes as f64 / 1_048_576.0,
+                stats.excluded
+            ),
+        );
+    }
 
     // Finish writing tar, then gzip, then flush/sync.
     let gz = tar
@@ -398,22 +612,51 @@ fn prune_old_backups(cfg: &Config) -> Result<()> {
     }
 
     backups.sort_by_key(|(d, _)| *d);
-    if backups.len() <= cfg.retain_count {
-        return Ok(());
-    }
 
-    let to_delete = backups.len() - cfg.retain_count;
-    log(
-        "INFO",
-        format!(
-            "found {} backups, pruning {} oldest (retain={})",
-            backups.len(),
-            to_delete,
-            cfg.retain_count
-        ),
-    );
+    let to_delete: Vec<String> = match &cfg.retention {
+        RetentionPolicy::Count(retain) => {
+            if backups.len() <= *retain {
+                return Ok(());
+            }
+            let n = backups.len() - *retain;
+            log(
+                "INFO",
+                format!(
+                    "found {} backups, pruning {} oldest (retain={})",
+                    backups.len(),
+                    n,
+                    retain
+                ),
+            );
+            backups.iter().take(n).map(|(_, f)| f.clone()).collect()
+        }
+        RetentionPolicy::Gfs { daily, weekly, monthly } => {
+            let keep = select_retained(&backups, *daily, *weekly, *monthly);
+            let doomed: Vec<String> = backups
+                .iter()
+                .filter(|(_, f)| !keep.contains(f))
+                .map(|(_, f)| f.clone())
+                .collect();
+            if doomed.is_empty() {
+                return Ok(());
+            }
+            log(
+                "INFO",
+                format!(
+                    "found {} backups, GFS keeps {} ({}d/{}w/{}m), pruning {}",
+                    backups.len(),
+                    keep.len(),
+                    daily,
+                    weekly,
+                    monthly,
+                    doomed.len()
+                ),
+            );
+            doomed
+        }
+    };
 
-    for (_, file_name) in backups.into_iter().take(to_delete) {
+    for file_name in to_delete {
         let backup_path = cfg.dest_dir.join(&file_name);
         let sha_path = cfg.dest_dir.join(format!("{file_name}.sha256"));
 
@@ -481,5 +724,193 @@ impl<W: Write> Write for HashingWriter<W> {
 
     fn flush(&mut self) -> std::io::Result<()> {
         self.inner.flush()
+    }
+}
+
+/// Choose which backups survive under grandfather-father-son retention.
+///
+/// `backups` must be sorted ASCENDING by date; filenames are date-keyed so
+/// dates are unique. Returns the union of three tiers:
+///   * the `daily` most recent backups
+///   * the newest backup in each of the `weekly` most recent ISO weeks
+///   * the newest backup in each of the `monthly` most recent months
+///
+/// Anchoring is by BUCKET, not by literal calendar day. Requiring an exact
+/// Sunday (or 1st-of-month) file silently forfeits that slot whenever the
+/// machine was off on that one day — the backup you most want after an outage
+/// is the one an outage would delete. Bucketing keeps the newest backup that
+/// actually exists in each period instead.
+fn select_retained(
+    backups: &[(NaiveDate, String)],
+    daily: usize,
+    weekly: usize,
+    monthly: usize,
+) -> HashSet<String> {
+    let mut keep = HashSet::new();
+
+    // Newest first for all three passes.
+    let desc: Vec<&(NaiveDate, String)> = backups.iter().rev().collect();
+
+    for (_, name) in desc.iter().take(daily) {
+        keep.insert((*name).clone());
+    }
+
+    // Newest-in-bucket, walking newest->oldest so the first sighting of a
+    // bucket is its winner.
+    let mut week_seen: HashMap<(i32, u32), ()> = HashMap::new();
+    for (date, name) in desc.iter() {
+        if week_seen.len() >= weekly {
+            break;
+        }
+        let iso = date.iso_week();
+        let key = (iso.year(), iso.week());
+        if week_seen.insert(key, ()).is_none() {
+            keep.insert((*name).clone());
+        }
+    }
+
+    let mut month_seen: HashMap<(i32, u32), ()> = HashMap::new();
+    for (date, name) in desc.iter() {
+        if month_seen.len() >= monthly {
+            break;
+        }
+        let key = (date.year(), date.month());
+        if month_seen.insert(key, ()).is_none() {
+            keep.insert((*name).clone());
+        }
+    }
+
+    keep
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mk(dates: &[&str]) -> Vec<(NaiveDate, String)> {
+        let mut v: Vec<(NaiveDate, String)> = dates
+            .iter()
+            .map(|d| {
+                let date = NaiveDate::parse_from_str(d, "%Y-%m-%d").unwrap();
+                (date, format!("vault-{d}.tar.gz"))
+            })
+            .collect();
+        v.sort_by_key(|(d, _)| *d);
+        v
+    }
+
+    fn run(dates: &[&str], d: usize, w: usize, m: usize) -> Vec<String> {
+        let b = mk(dates);
+        let keep = select_retained(&b, d, w, m);
+        let mut out: Vec<String> = keep.into_iter().collect();
+        out.sort();
+        out
+    }
+
+    /// 40 consecutive days: the ladder must collapse to well under 40.
+    #[test]
+    fn gfs_collapses_a_long_run() {
+        let dates: Vec<String> = (0..40)
+            .map(|i| {
+                (NaiveDate::from_ymd_opt(2026, 1, 1).unwrap() + chrono::Duration::days(i))
+                    .format("%Y-%m-%d")
+                    .to_string()
+            })
+            .collect();
+        let refs: Vec<&str> = dates.iter().map(|s| s.as_str()).collect();
+        let kept = run(&refs, 7, 4, 4);
+        // 7 dailies + up to 4 week-winners + up to 2 month-winners (Jan/Feb),
+        // minus overlap where a week/month winner is already a daily.
+        assert!(kept.len() <= 13, "kept too many: {}", kept.len());
+        assert!(kept.len() >= 7, "must keep at least the dailies: {}", kept.len());
+        // The newest 7 are always present.
+        for d in refs.iter().rev().take(7) {
+            assert!(kept.contains(&format!("vault-{d}.tar.gz")), "missing daily {d}");
+        }
+    }
+
+    /// The oldest backup in a long run must be pruned, not kept forever.
+    #[test]
+    fn oldest_is_pruned() {
+        let dates: Vec<String> = (0..60)
+            .map(|i| {
+                (NaiveDate::from_ymd_opt(2026, 1, 1).unwrap() + chrono::Duration::days(i))
+                    .format("%Y-%m-%d")
+                    .to_string()
+            })
+            .collect();
+        let refs: Vec<&str> = dates.iter().map(|s| s.as_str()).collect();
+        let kept = run(&refs, 7, 4, 4);
+        assert!(!kept.contains(&"vault-2026-01-01.tar.gz".to_string()));
+    }
+
+    /// A gap on Sunday must NOT forfeit the weekly slot — the whole reason for
+    /// bucket anchoring rather than literal weekday matching.
+    #[test]
+    fn missed_sunday_still_keeps_that_week() {
+        // Week of 2026-01-05..11 (Mon..Sun); Sunday the 11th is MISSING.
+        let kept = run(
+            &["2026-01-05", "2026-01-06", "2026-01-07", "2026-01-08", "2026-01-09",
+              "2026-01-19", "2026-01-20", "2026-01-21", "2026-01-22", "2026-01-23",
+              "2026-01-24", "2026-01-25", "2026-01-26"],
+            3, 3, 1,
+        );
+        // The Jan 5-9 week is one of the 3 most recent weeks present, and its
+        // newest member (the 9th) must survive despite no Sunday existing.
+        assert!(
+            kept.contains(&"vault-2026-01-09.tar.gz".to_string()),
+            "weekly bucket lost because no Sunday existed: {kept:?}"
+        );
+    }
+
+    /// Monthly tier keeps the newest backup of each month, not the 1st.
+    #[test]
+    fn monthly_keeps_newest_in_month() {
+        let kept = run(
+            &["2026-01-02", "2026-01-17", "2026-02-03", "2026-02-27", "2026-03-05"],
+            1, 0, 3,
+        );
+        assert!(kept.contains(&"vault-2026-01-17.tar.gz".to_string()), "{kept:?}");
+        assert!(kept.contains(&"vault-2026-02-27.tar.gz".to_string()), "{kept:?}");
+        assert!(!kept.contains(&"vault-2026-01-02.tar.gz".to_string()), "{kept:?}");
+    }
+
+    /// Fewer backups than the ladder asks for: keep everything, delete nothing.
+    #[test]
+    fn small_set_keeps_all() {
+        let dates = ["2026-05-01", "2026-05-02", "2026-05-03"];
+        let kept = run(&dates, 7, 4, 4);
+        assert_eq!(kept.len(), 3);
+    }
+
+    #[test]
+    fn exclude_component_matches_any_depth() {
+        let p = ExcludePattern::parse(".venv");
+        assert!(p.matches(Path::new("proj/.venv/lib/x.py")));
+        assert!(p.matches(Path::new(".venv")));
+        assert!(!p.matches(Path::new("proj/venv/x.py")));
+    }
+
+    #[test]
+    fn exclude_extension_is_case_insensitive() {
+        let p = ExcludePattern::parse("*.PYC");
+        assert!(p.matches(Path::new("a/b/c.pyc")));
+        assert!(!p.matches(Path::new("a/b/c.py")));
+    }
+
+    #[test]
+    fn exclude_prefix_matches_subtree_only() {
+        let p = ExcludePattern::parse("agents/hermes/pm/runtime");
+        assert!(p.matches(Path::new("agents/hermes/pm/runtime/state.db")));
+        assert!(!p.matches(Path::new("agents/hermes/pm/notes.md")));
+    }
+
+    #[test]
+    fn stversions_is_excluded_but_real_notes_are_not() {
+        let pats: Vec<ExcludePattern> = [".stversions", ".venv", "node_modules", "*.pyc"]
+            .iter().map(|p| ExcludePattern::parse(p)).collect();
+        assert!(is_excluded(Path::new(".stversions/Notes/old.md"), &pats));
+        assert!(is_excluded(Path::new("x/node_modules/y/z.js"), &pats));
+        assert!(!is_excluded(Path::new("Notes/2026/thinking.md"), &pats));
     }
 }
