@@ -110,6 +110,24 @@ pm2 start "$(command -v forever-ago)" --name forever-ago -- \
 pm2 save
 ```
 
+## Which snapshots exist for this directory?
+
+```console
+$ cd ~/code/DeLoDocs && forever-ago list
+Snapshots:
+1   2026-10-01  (today)         330M
+2   2026-09-30  (1d ago)        329M
+...
+10  2026-08-31  (1 month ago)   256M
+11  2026-07-31  (2 months ago)  236M
+
+~/backups/delodocs/vault-YYYY-MM-DD.tar.gz
+```
+
+Snapshots are found through the jobs that write them (see below), newest first.
+If the current directory has none of its own, `list` climbs to the nearest
+ancestor (stopping at `~`) that does. Snapshots missing their `.sha256` are marked.
+
 ## Which jobs cover this directory?
 
 ```bash

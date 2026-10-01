@@ -96,11 +96,11 @@ impl Invocation {
 
 /// An invocation interpreted the way forever-ago itself would interpret it.
 #[derive(Debug)]
-struct Job {
+pub(crate) struct Job {
     inv: Invocation,
-    source: PathBuf,
-    dest_dir: PathBuf,
-    prefix: Option<String>,
+    pub(crate) source: PathBuf,
+    pub(crate) dest_dir: PathBuf,
+    pub(crate) prefix: Option<String>,
     once: bool,
     run_now: bool,
     at: String,
@@ -112,6 +112,11 @@ struct Job {
 }
 
 impl Job {
+    /// "forever-ago-vault.service (systemd --user)"
+    pub(crate) fn describe(&self) -> String {
+        format!("{} ({})", self.inv.name, self.inv.scheduler.label())
+    }
+
     fn same_target(&self, other: &Job) -> bool {
         self.source == other.source && self.dest_dir == other.dest_dir && self.prefix == other.prefix
     }
@@ -198,14 +203,27 @@ impl Sources {
     }
 }
 
-pub(crate) fn run(args: &JobsArgs) -> Result<()> {
-    let src = Sources::from_host()?;
+pub(crate) struct Discovery {
+    pub(crate) home: PathBuf,
+    pub(crate) jobs: Vec<Job>,
+}
+
+/// Every forever-ago job on this machine. `live` also asks systemctl for
+/// next/last run, which only `jobs` displays.
+pub(crate) fn discover_host(live: bool) -> Result<Discovery> {
+    let mut src = Sources::from_host()?;
+    src.live = live;
     let (jobs, warnings) = discover(&src);
     for w in &warnings {
         eprintln!("warning: {w}");
     }
+    Ok(Discovery { home: src.home, jobs })
+}
+
+pub(crate) fn run(args: &JobsArgs) -> Result<()> {
+    let found = discover_host(true)?;
     let cwd = std::env::current_dir()?;
-    print!("{}", report(&jobs, &cwd, &src.home, args.all));
+    print!("{}", report(&found.jobs, &cwd, &found.home, args.all));
     Ok(())
 }
 
@@ -261,12 +279,20 @@ fn report(jobs: &[Job], cwd: &Path, home: &Path, all: bool) -> String {
 
 /// Climb from `start` toward the root, stopping after `stop` (the home dir),
 /// and return the first directory some job backs up.
-fn covering<'a>(jobs: &'a [Job], start: &Path, stop: &Path) -> Option<(PathBuf, Vec<&'a Job>)> {
+pub(crate) fn covering<'a>(jobs: &'a [Job], start: &Path, stop: &Path) -> Option<(PathBuf, Vec<&'a Job>)> {
+    climb(start, stop, |dir| {
+        let hits: Vec<&Job> = jobs.iter().filter(|j| j.source == dir).collect();
+        (!hits.is_empty()).then_some(hits)
+    })
+}
+
+/// Walk `start`, then each parent, until `found` answers or `stop` (the home
+/// dir) has been checked. Outside `stop` the walk ends at the filesystem root.
+pub(crate) fn climb<T>(start: &Path, stop: &Path, mut found: impl FnMut(&Path) -> Option<T>) -> Option<(PathBuf, T)> {
     let mut dir = Some(start);
     while let Some(d) = dir {
-        let hits: Vec<&Job> = jobs.iter().filter(|j| j.source == d).collect();
-        if !hits.is_empty() {
-            return Some((d.to_path_buf(), hits));
+        if let Some(hit) = found(d) {
+            return Some((d.to_path_buf(), hit));
         }
         if d == stop {
             break;
@@ -1159,7 +1185,7 @@ fn resolve_path(path: &Path, cwd: &Path, home: &Path) -> PathBuf {
 
 /// Canonical when the path exists (so symlinked spellings compare equal),
 /// otherwise lexically cleaned — a job whose source is gone still shows up.
-fn canonical_or_normalized(path: &Path) -> PathBuf {
+pub(crate) fn canonical_or_normalized(path: &Path) -> PathBuf {
     if let Ok(p) = fs::canonicalize(path) {
         return p;
     }
@@ -1180,7 +1206,7 @@ fn canonical_or_normalized(path: &Path) -> PathBuf {
 // Rendering
 // ---------------------------------------------------------------------------
 
-fn tilde(path: &Path, home: &Path) -> String {
+pub(crate) fn tilde(path: &Path, home: &Path) -> String {
     match path.strip_prefix(home) {
         Ok(rest) if rest.as_os_str().is_empty() => "~".to_string(),
         Ok(rest) => format!("~/{}", rest.display()),
@@ -1319,6 +1345,14 @@ fn describe_backups(dest_dir: &Path, prefix: &str) -> String {
             *size as f64 / 1_048_576.0
         ),
     }
+}
+
+/// A job as if found in a crontab, for other modules' tests.
+#[cfg(test)]
+pub(crate) fn test_job(argv: &[&str], cwd: &Path, home: &Path) -> Job {
+    let argv = argv.iter().map(|s| s.to_string()).collect();
+    let inv = Invocation::new(Scheduler::Cron, "test-job".into(), "test".into(), argv, cwd.into(), home.into());
+    resolve(inv).expect("a backup invocation")
 }
 
 #[cfg(test)]

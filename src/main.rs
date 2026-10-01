@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 mod jobs;
+mod list;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -115,6 +116,13 @@ enum Command {
     /// job backs up the current directory itself, walks up its parents (stopping
     /// at ~) and reports the nearest one that has jobs.
     Jobs(jobs::JobsArgs),
+
+    /// List the snapshots of the current directory, newest first.
+    ///
+    /// Snapshots are found through the jobs that write them. If none exist for
+    /// the current directory itself, walks up its parents (stopping at ~) and
+    /// lists the nearest one that has snapshots.
+    List,
 }
 
 /// How many backups to keep, and by what rule.
@@ -143,8 +151,10 @@ struct Config {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    if let Some(Command::Jobs(args)) = &cli.command {
-        return jobs::run(args);
+    match &cli.command {
+        Some(Command::Jobs(args)) => return jobs::run(args),
+        Some(Command::List) => return list::run(),
+        None => {}
     }
     let prefix = cli
         .prefix
@@ -1143,6 +1153,7 @@ mod tests {
     #[test]
     fn jobs_subcommand_needs_no_prefix_but_backups_do() {
         assert!(matches!(cli(&["jobs"]).unwrap().command, Some(Command::Jobs(_))));
+        assert!(matches!(cli(&["list"]).unwrap().command, Some(Command::List)));
         assert!(cli(&[]).is_err());
         assert!(cli(&["--prefix", "v", "jobs"]).is_err());
     }
