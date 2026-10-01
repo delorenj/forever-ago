@@ -6,7 +6,7 @@
 //! destinations under their prefixes.
 
 use crate::jobs::{self, Job};
-use crate::parse_backup_date;
+use crate::{human_size, parse_backup_date};
 use anyhow::Result;
 use chrono::{Local, NaiveDate};
 use std::collections::BTreeMap;
@@ -36,19 +36,35 @@ fn report(jobs: &[Job], cwd: &Path, home: &Path, today: NaiveDate) -> String {
     let cwd = jobs::canonical_or_normalized(cwd);
     let stop = jobs::canonical_or_normalized(home);
     let mut out = String::new();
+    // Jobs between `cwd` and `floor` whose excludes leave `cwd` out: their
+    // snapshots do not contain it, so the climb passed them by.
+    let excluding = |floor: &Path| -> String {
+        let skipped: Vec<(&Job, &str)> = jobs
+            .iter()
+            .filter(|j| cwd.starts_with(&j.source) && j.source.starts_with(floor))
+            .filter_map(|j| jobs::excluded_by(j, &cwd).map(|p| (j, p)))
+            .collect();
+        jobs::excluding_note(&skipped, &cwd, home)
+    };
 
     let Some((dir, shelves)) = jobs::climb(&cwd, &stop, |dir| {
-        let shelves = shelves_for(jobs, dir);
+        let shelves = shelves_for(jobs, dir, &cwd);
         (!shelves.is_empty()).then_some(shelves)
     }) else {
-        let limit = if cwd.starts_with(&stop) { jobs::tilde(&stop, home) } else { "/".to_string() };
+        let (limit, floor) = if cwd.starts_with(&stop) {
+            (jobs::tilde(&stop, home), stop.clone())
+        } else {
+            ("/".to_string(), PathBuf::from("/"))
+        };
         out.push_str(&format!(
             "no snapshots of {} (searched it and every parent up to {limit})\n",
             jobs::tilde(&cwd, home)
         ));
+        let skipped = excluding(&floor);
+        out.push_str(&skipped);
         // A job that has simply not run yet deserves a mention; otherwise
         // the answer to "where are my snapshots?" is to set one up.
-        match jobs::covering(jobs, &cwd, &stop) {
+        match jobs::covering(jobs, &cwd, &stop).found {
             Some((covered, found)) => {
                 for job in found {
                     out.push_str(&format!(
@@ -58,17 +74,24 @@ fn report(jobs: &[Job], cwd: &Path, home: &Path, today: NaiveDate) -> String {
                     ));
                 }
             }
-            None => out.push_str("no scheduled job backs it up either; see `forever-ago jobs --all`\n"),
+            None if skipped.is_empty() => {
+                out.push_str("no scheduled job backs it up either; see `forever-ago jobs --all`\n");
+            }
+            None => {}
         }
         return out;
     };
 
     if dir != cwd {
         out.push_str(&format!(
-            "no snapshots of {} itself; nearest ancestor with snapshots: {}\n\n",
+            "no snapshots of {} itself; nearest ancestor with snapshots: {}\n",
             jobs::tilde(&cwd, home),
             jobs::tilde(&dir, home)
         ));
+    }
+    out.push_str(&excluding(&dir));
+    if !out.is_empty() {
+        out.push('\n');
     }
     let single = shelves.len() == 1;
     for (i, ((dest, prefix), snaps)) in shelves.iter().enumerate() {
@@ -93,10 +116,11 @@ fn location(dest: &Path, prefix: &str, home: &Path) -> String {
     format!("{}/{prefix}-YYYY-MM-DD.tar.gz", jobs::tilde(dest, home))
 }
 
-/// The jobs backing up exactly `dir`, as destinations that hold at least one snapshot.
-fn shelves_for(jobs: &[Job], dir: &Path) -> Vec<Shelf> {
+/// The jobs backing up exactly `dir`, as destinations that hold at least one
+/// snapshot. A job that excludes `cwd` is skipped: its snapshots do not have it.
+fn shelves_for(jobs: &[Job], dir: &Path, cwd: &Path) -> Vec<Shelf> {
     let mut places: BTreeMap<(PathBuf, String), ()> = BTreeMap::new();
-    for job in jobs.iter().filter(|j| j.source == dir) {
+    for job in jobs.iter().filter(|j| j.source == dir && jobs::excluded_by(j, cwd).is_none()) {
         if let Some(prefix) = &job.prefix {
             places.insert((job.dest_dir.clone(), prefix.clone()), ());
         }
@@ -163,23 +187,6 @@ fn ago(date: NaiveDate, today: NaiveDate) -> String {
         7..30 => format!("{}w ago", days / 7),
         30..365 => plural(days / 30, "month"),
         _ => plural(days / 365, "year"),
-    }
-}
-
-/// "1.23GB" from a gigabyte up, "985M" / "12K" / "512B" below it (1024-based).
-fn human_size(bytes: u64) -> String {
-    const K: f64 = 1024.0;
-    let b = bytes as f64;
-    if b >= K * K * K * K {
-        format!("{:.2}TB", b / (K * K * K * K))
-    } else if b >= K * K * K {
-        format!("{:.2}GB", b / (K * K * K))
-    } else if b >= K * K {
-        format!("{:.0}M", b / (K * K))
-    } else if b >= K {
-        format!("{:.0}K", b / K)
-    } else {
-        format!("{bytes}B")
     }
 }
 
@@ -334,6 +341,39 @@ mod tests {
             "no snapshots of ~/projects/x (searched it and every parent up to ~)\n\
              no scheduled job backs it up either; see `forever-ago jobs --all`\n"
         );
+    }
+
+    /// A job that excludes the cwd has no snapshots *of* it: skip to the next
+    /// level up, and say which job was passed over.
+    #[test]
+    fn skips_snapshots_that_exclude_the_cwd() {
+        let t = Tree::new();
+        let cwd = t.dir("vault/node_modules/pkg");
+        t.archive("backups/vault", "vault-2026-09-30.tar.gz", MIB);
+        t.archive("backups/home", "home-2026-09-29.tar.gz", 2 * MIB);
+        let excl = jobs::test_job(
+            &["forever-ago", "--source", "vault", "--dest-dir", "backups/vault", "--prefix", "vault", "--once", "--exclude", "node_modules"],
+            &t.home,
+            &t.home,
+        );
+        let jobs = vec![excl, t.job(".", "backups/home", "home")];
+        let out = report(&jobs, &cwd, &t.home, day("2026-10-01"));
+        assert_eq!(
+            out,
+            "no snapshots of ~/vault/node_modules/pkg itself; nearest ancestor with snapshots: ~\n\
+             test-job (cron) backs up ~/vault but excludes ~/vault/node_modules/pkg (`node_modules`)\n\
+             \n\
+             Snapshots:\n\
+             1   2026-09-29  (2d ago)  2M\n\
+             \n\
+             ~/backups/home/home-YYYY-MM-DD.tar.gz\n"
+        );
+
+        // Nothing else has it: name the job that skips it instead of saying nothing backs it up.
+        let only = vec![jobs.into_iter().next().unwrap()];
+        let out = report(&only, &cwd, &t.home, day("2026-10-01"));
+        assert!(out.contains("but excludes ~/vault/node_modules/pkg"), "{out}");
+        assert!(!out.contains("no scheduled job backs it up"), "{out}");
     }
 
     #[test]

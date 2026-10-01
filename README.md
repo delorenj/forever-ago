@@ -51,12 +51,14 @@ forever-ago ... --exclude node_modules --exclude '*.pyc' --exclude-from ./backup
 
 Patterns match each entry's path relative to the source root:
 
-| pattern             | excludes                                                   |
-| ------------------- | ---------------------------------------------------------- |
-| `name`              | any path component named exactly `name` (`.venv`)          |
-| `*.ext`             | files with that extension, case-insensitive (`*.pyc`)      |
+| pattern             | excludes                                                    |
+| ------------------- | ----------------------------------------------------------- |
+| `name`              | any path component named exactly `name` (`.venv`)           |
+| `./name`            | `name` at the source root only                              |
+| `*.ext`             | files with that extension, case-insensitive (`*.pyc`)       |
+| `*.ext/`            | directories with that extension (`*.egg-info/`)             |
 | `na*e?`             | any path component matching `*` / `?` (`*.sync-conflict-*`) |
-| `a/b/c`             | that subtree of the source root                            |
+| `a/b/c`             | that subtree of the source root                             |
 
 An excluded directory is pruned whole and never walked. `--exclude-from` reads one
 pattern per line and skips blank lines and lines starting with `#`.
@@ -64,13 +66,15 @@ pattern per line and skips blank lines and lines starting with `#`.
 This is deliberately not a full glob engine. A pattern that could never match is a
 startup error, so a typo fails the run loudly instead of quietly archiving what it
 was meant to drop. Examples: wildcards inside `a/b/c`, a leading `/`, an empty line,
-or a lone `*`.
+or a lone `*`. If a `*.ext` pattern meets a directory with that extension, the run
+keeps the directory and logs a WARN suggesting `*.ext/`.
 
 ## What goes into the archive
 
-- Regular files are copied at the size they had when opened. If a file changes
-  while it is being read, the run logs a WARN for it rather than writing a
-  misaligned, corrupt archive.
+- Regular files are copied at the size they had when opened, so a file that
+  changes mid-read can never misalign the archive. Changes are detected by size,
+  mtime and ctime, and each one is logged as a WARN. A write through a shared mmap
+  can slip past all three.
 - Symlinks are stored as links and never followed, including dangling ones.
 - Paths that vanish mid-walk are logged and skipped. Any other read error fails the run.
 - Sockets, FIFOs and devices are skipped with a WARN.
@@ -138,8 +142,12 @@ forever-ago jobs --all    # every job on the machine
 forever-ago keeps no registry, so `jobs` finds invocations where the schedulers
 keep them:
 
-- systemd unit files (user and system, with drop-ins, timers, and whether they are enabled)
-- your crontab, `/etc/crontab`, and `/etc/cron.d`
+- systemd units, user and system. It uses systemd's own search path (including
+  `systemd-run` transient units) and handles template instances, drop-ins,
+  `Environment=`/`EnvironmentFile=` and specifiers. Units can be started by a
+  timer, a path unit, or a target that wants them.
+- your crontab, `/etc/crontab`, and `/etc/cron.d`, read as a shell would: `cd X &&`,
+  `sh -c`, wrappers like `nice`/`flock`/`timeout`, `$VAR`, and `$(hostname)`
 - the PM2 dump (`~/.pm2/dump.pm2`)
 - forever-ago daemons that are running right now
 
@@ -148,3 +156,6 @@ job it shows the schedule, next and last run (from systemd), destination,
 retention, excludes, and the backups currently on disk. It also warns when the
 current directory is excluded from that job, and when a job will never fire
 (timer disabled, pm2 process stopped, or `--once` with nothing to trigger it).
+
+A job whose excludes leave the current directory out does not count as covering
+it, so `jobs` and `list` keep climbing past it and say which job they skipped.

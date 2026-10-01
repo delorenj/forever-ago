@@ -7,7 +7,7 @@
 //! and flag semantics are exactly what an actual run would use.
 
 use crate::{
-    Cli, ExcludePattern, RetentionPolicy, parse_backup_date, read_exclude_file, retention_policy,
+    Cli, ExcludePattern, RetentionPolicy, human_size, parse_backup_date, read_exclude_file, retention_policy,
 };
 use anyhow::{Result, anyhow};
 use clap::Parser;
@@ -18,13 +18,85 @@ use std::process::Command;
 
 const BIN: &str = "forever-ago";
 
-/// Commands that run another command: `nice -n 10 forever-ago ...` is still a forever-ago job.
-const WRAPPERS: &[&str] = &[
-    "env", "nice", "ionice", "nohup", "timeout", "flock", "chrt", "taskset", "setsid", "stdbuf",
-    "systemd-cat", "systemd-inhibit", "time", "sudo", "doas", "runuser", "exec", "command",
-    "chronic", "cronic", "mise",
-];
 const SHELLS: &[&str] = &["sh", "bash", "zsh", "dash", "ksh", "fish"];
+
+/// Note left on a process whose working directory we cannot read.
+const UNKNOWN_CWD: &str = "its working directory is not readable by you";
+
+/// A command that runs another command: `nice -n 10 forever-ago ...` is
+/// still a forever-ago job. To find the command it runs, step over the
+/// wrapper's options (`value_opts` take the next word), then `positionals`
+/// words of its own (timeout's duration, flock's lock file). `command_opts`
+/// take a whole shell command line (`flock -c "..."`), and `chdir_opts` move
+/// the command's working directory.
+struct Wrapper {
+    name: &'static str,
+    value_opts: &'static [&'static str],
+    command_opts: &'static [&'static str],
+    chdir_opts: &'static [&'static str],
+    positionals: usize,
+}
+
+const fn wrapper(name: &'static str, value_opts: &'static [&'static str], positionals: usize) -> Wrapper {
+    Wrapper { name, value_opts, command_opts: &[], chdir_opts: &[], positionals }
+}
+
+const WRAPPERS: &[Wrapper] = &[
+    Wrapper {
+        name: "env",
+        value_opts: &["-u", "--unset", "-C", "--chdir", "-S", "--split-string"],
+        command_opts: &["-S", "--split-string"],
+        chdir_opts: &["-C", "--chdir"],
+        positionals: 0,
+    },
+    wrapper("nice", &["-n", "--adjustment"], 0),
+    wrapper("ionice", &["-c", "--class", "-n", "--classdata", "-p", "--pid", "-P", "--pgid", "-u", "--uid"], 0),
+    wrapper("nohup", &[], 0),
+    wrapper("setsid", &[], 0),
+    wrapper("time", &["-f", "--format", "-o", "--output"], 0),
+    wrapper("exec", &["-a"], 0),
+    wrapper("command", &[], 0),
+    wrapper("timeout", &["-s", "--signal", "-k", "--kill-after"], 1),
+    Wrapper {
+        name: "flock",
+        value_opts: &["-w", "--wait", "--timeout", "-E", "--conflict-exit-code", "-c", "--command"],
+        command_opts: &["-c", "--command"],
+        chdir_opts: &[],
+        positionals: 1,
+    },
+    wrapper("chrt", &["-T", "--sched-runtime", "-P", "--sched-period", "-D", "--sched-deadline"], 1),
+    wrapper("taskset", &[], 1),
+    wrapper("stdbuf", &["-i", "--input", "-o", "--output", "-e", "--error"], 0),
+    wrapper("systemd-cat", &["-t", "--identifier", "-p", "--priority", "--stderr-priority"], 0),
+    wrapper("systemd-inhibit", &["--what", "--who", "--why", "--mode"], 0),
+    Wrapper {
+        name: "sudo",
+        value_opts: &[
+            "-u", "--user", "-g", "--group", "-C", "--close-from", "-D", "--chdir", "-h", "--host", "-p",
+            "--prompt", "-r", "--role", "-t", "--type", "-U", "--other-user", "-T", "--command-timeout",
+        ],
+        command_opts: &[],
+        chdir_opts: &["-D", "--chdir"],
+        positionals: 0,
+    },
+    wrapper("doas", &["-u", "-C"], 0),
+    Wrapper {
+        name: "runuser",
+        value_opts: &["-u", "--user", "-g", "--group", "-G", "--supp-group", "-s", "--shell", "-c", "--command"],
+        command_opts: &["-c", "--command"],
+        chdir_opts: &[],
+        positionals: 0,
+    },
+    Wrapper {
+        name: "su",
+        value_opts: &["-g", "--group", "-G", "--supp-group", "-s", "--shell", "-c", "--command", "-w"],
+        command_opts: &["-c", "--command"],
+        chdir_opts: &[],
+        positionals: 1,
+    },
+    wrapper("chronic", &[], 0),
+    wrapper("cronic", &[], 0),
+];
 
 #[derive(clap::Args, Debug)]
 pub(crate) struct JobsArgs {
@@ -74,6 +146,8 @@ struct Invocation {
     state: Vec<(String, String)>,
     /// systemd units (service first, then its timers) to ask systemctl about.
     units: Vec<String>,
+    /// Caveats found while reading the scheduler's config (unexpanded specifiers, ...).
+    notes: Vec<String>,
 }
 
 impl Invocation {
@@ -90,6 +164,7 @@ impl Invocation {
             enabled: None,
             state: Vec::new(),
             units: Vec::new(),
+            notes: Vec::new(),
         }
     }
 }
@@ -134,6 +209,11 @@ struct Sources {
     pm2_dump: Option<PathBuf>,
     proc_root: Option<PathBuf>,
     passwd: PathBuf,
+    /// Who is running `jobs`, for systemd's %u/%U and the user manager's $USER.
+    user: String,
+    uid: String,
+    runtime_dir: PathBuf,
+    host: String,
     /// Ask systemctl for next/last run and live unit state.
     live: bool,
 }
@@ -159,31 +239,75 @@ impl Sources {
 
         let mut system_crontabs = vec![PathBuf::from("/etc/crontab")];
         if let Ok(rd) = fs::read_dir("/etc/cron.d") {
-            let mut more: Vec<PathBuf> = rd.flatten().map(|e| e.path()).filter(|p| p.is_file()).collect();
+            // cron itself skips names with anything but [A-Za-z0-9_-]
+            // (forever-ago.disabled, foo.dpkg-old), so do the same.
+            let mut more: Vec<PathBuf> = rd
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.is_file())
+                .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(cron_reads))
+                .collect();
             more.sort();
             system_crontabs.extend(more);
         }
 
         let pm2_home = std::env::var_os("PM2_HOME").map(PathBuf::from).unwrap_or_else(|| home.join(".pm2"));
+        let uid = fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|s| s.lines().find_map(|l| l.strip_prefix("Uid:")).and_then(|ids| ids.split_whitespace().next().map(str::to_string)))
+            .unwrap_or_default();
+        let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(format!("/run/user/{uid}")));
 
-        Ok(Self {
-            user_unit_dirs: vec![
+        // systemd's own answer, including transient (systemd-run), runtime,
+        // control and generator directories. The fallback is its documented order.
+        let user_unit_dirs = unit_paths(true).unwrap_or_else(|| {
+            let rt = runtime_dir.join("systemd");
+            vec![
+                config.join("systemd/user.control"),
+                rt.join("user.control"),
+                rt.join("transient"),
+                rt.join("generator.early"),
                 config.join("systemd/user"),
                 PathBuf::from("/etc/systemd/user"),
+                rt.join("user"),
+                PathBuf::from("/run/systemd/user"),
+                rt.join("generator"),
                 data.join("systemd/user"),
                 PathBuf::from("/usr/local/share/systemd/user"),
                 PathBuf::from("/usr/share/systemd/user"),
                 PathBuf::from("/usr/local/lib/systemd/user"),
                 PathBuf::from("/usr/lib/systemd/user"),
-                PathBuf::from("/lib/systemd/user"),
-            ],
-            system_unit_dirs: vec![
-                PathBuf::from("/etc/systemd/system"),
-                PathBuf::from("/run/systemd/system"),
-                PathBuf::from("/usr/local/lib/systemd/system"),
-                PathBuf::from("/usr/lib/systemd/system"),
-                PathBuf::from("/lib/systemd/system"),
-            ],
+                rt.join("generator.late"),
+            ]
+        });
+        let system_unit_dirs = unit_paths(false).unwrap_or_else(|| {
+            [
+                "/etc/systemd/system.control",
+                "/run/systemd/system.control",
+                "/run/systemd/transient",
+                "/run/systemd/generator.early",
+                "/etc/systemd/system",
+                "/etc/systemd/system.attached",
+                "/run/systemd/system",
+                "/run/systemd/system.attached",
+                "/run/systemd/generator",
+                "/usr/local/lib/systemd/system",
+                "/usr/lib/systemd/system",
+                "/run/systemd/generator.late",
+            ]
+            .map(PathBuf::from)
+            .to_vec()
+        });
+
+        Ok(Self {
+            user_unit_dirs,
+            system_unit_dirs,
+            user: std::env::var("USER").unwrap_or_default(),
+            uid,
+            runtime_dir,
+            host: hostname(),
             crontab,
             system_crontabs,
             pm2_dump: Some(pm2_home.join("dump.pm2")),
@@ -201,6 +325,33 @@ impl Sources {
             (f.len() >= 6 && (f[0] == user_or_uid || f[2] == user_or_uid)).then(|| PathBuf::from(f[5]))
         })
     }
+}
+
+/// `systemd-analyze [--user] unit-paths`: the search path in precedence order.
+fn unit_paths(user: bool) -> Option<Vec<PathBuf>> {
+    let mut cmd = Command::new("systemd-analyze");
+    if user {
+        cmd.arg("--user");
+    }
+    let out = cmd.arg("unit-paths").output().ok().filter(|o| o.status.success())?;
+    let dirs: Vec<PathBuf> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(PathBuf::from)
+        .collect();
+    (!dirs.is_empty()).then_some(dirs)
+}
+
+/// Whether cron reads a file in /etc/cron.d with this name (run-parts rules).
+fn cron_reads(name: &str) -> bool {
+    !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+fn hostname() -> String {
+    ["/proc/sys/kernel/hostname", "/etc/hostname"]
+        .iter()
+        .find_map(|p| fs::read_to_string(p).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()))
+        .unwrap_or_else(|| "localhost".into())
 }
 
 pub(crate) struct Discovery {
@@ -241,7 +392,7 @@ fn report(jobs: &[Job], cwd: &Path, home: &Path, all: bool) -> String {
         }
         let blocks: Vec<String> = groups
             .into_iter()
-            .map(|(source, group)| render_group(source, &group, home, None))
+            .map(|(source, group)| render_group(source, &group, home))
             .collect();
         out.push_str(&blocks.join("\n"));
         return out;
@@ -249,16 +400,22 @@ fn report(jobs: &[Job], cwd: &Path, home: &Path, all: bool) -> String {
 
     let cwd = canonical_or_normalized(cwd);
     let stop = canonical_or_normalized(home);
-    match covering(jobs, &cwd, &stop) {
+    let coverage = covering(jobs, &cwd, &stop);
+    let excluding = coverage.excluding_note(&cwd, home);
+    match coverage.found {
         Some((dir, group)) => {
             if dir != cwd {
                 out.push_str(&format!(
-                    "no jobs back up {} itself; nearest ancestor with jobs: {}\n\n",
+                    "no jobs back up {} itself; nearest ancestor with jobs: {}\n",
                     tilde(&cwd, home),
                     tilde(&dir, home)
                 ));
             }
-            out.push_str(&render_group(&dir, &group, home, Some(&cwd)));
+            out.push_str(&excluding);
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(&render_group(&dir, &group, home));
         }
         None => {
             let limit = if cwd.starts_with(&stop) { tilde(&stop, home) } else { "/".to_string() };
@@ -266,6 +423,7 @@ fn report(jobs: &[Job], cwd: &Path, home: &Path, all: bool) -> String {
                 "no scheduled forever-ago jobs cover {} (searched it and every parent up to {limit})\n",
                 tilde(&cwd, home)
             ));
+            out.push_str(&excluding);
             if !jobs.is_empty() {
                 out.push_str(&format!(
                     "{} job(s) back up other directories; `forever-ago jobs --all` lists them\n",
@@ -277,13 +435,51 @@ fn report(jobs: &[Job], cwd: &Path, home: &Path, all: bool) -> String {
     out
 }
 
+pub(crate) struct Coverage<'a> {
+    /// The nearest directory whose jobs really back `start` up, and those jobs.
+    pub(crate) found: Option<(PathBuf, Vec<&'a Job>)>,
+    /// Jobs passed on the way whose excludes leave `start` out, with the pattern.
+    pub(crate) excluding: Vec<(&'a Job, &'a str)>,
+}
+
+impl Coverage<'_> {
+    fn excluding_note(&self, cwd: &Path, home: &Path) -> String {
+        excluding_note(&self.excluding, cwd, home)
+    }
+}
+
+/// One line per job that was passed over because it excludes `cwd`.
+pub(crate) fn excluding_note(excluding: &[(&Job, &str)], cwd: &Path, home: &Path) -> String {
+    excluding
+        .iter()
+        .map(|(job, pattern)| {
+            format!(
+                "{} backs up {} but excludes {} (`{pattern}`)\n",
+                job.describe(),
+                tilde(&job.source, home),
+                tilde(cwd, home)
+            )
+        })
+        .collect()
+}
+
 /// Climb from `start` toward the root, stopping after `stop` (the home dir),
-/// and return the first directory some job backs up.
-pub(crate) fn covering<'a>(jobs: &'a [Job], start: &Path, stop: &Path) -> Option<(PathBuf, Vec<&'a Job>)> {
-    climb(start, stop, |dir| {
-        let hits: Vec<&Job> = jobs.iter().filter(|j| j.source == dir).collect();
+/// and return the first directory with a job that backs `start` up. A job
+/// whose excludes leave `start` out does not count — its archives do not
+/// contain it — so the climb continues past it.
+pub(crate) fn covering<'a>(jobs: &'a [Job], start: &Path, stop: &Path) -> Coverage<'a> {
+    let mut excluding = Vec::new();
+    let found = climb(start, stop, |dir| {
+        let mut hits = Vec::new();
+        for job in jobs.iter().filter(|j| j.source == dir) {
+            match excluded_by(job, start) {
+                Some(pattern) => excluding.push((job, pattern)),
+                None => hits.push(job),
+            }
+        }
         (!hits.is_empty()).then_some(hits)
-    })
+    });
+    Coverage { found, excluding }
 }
 
 /// Walk `start`, then each parent, until `found` answers or `stop` (the home
@@ -363,12 +559,15 @@ fn discover(src: &Sources) -> (Vec<Job>, Vec<String>) {
 }
 
 /// Interpret an invocation with the real CLI. `None` means it is not a backup
-/// run at all (e.g. someone scheduled `forever-ago jobs`).
+/// run at all (`forever-ago jobs`, `--help`, `--version`), or it cannot be
+/// tied to a directory.
 fn resolve(inv: Invocation) -> Option<Job> {
+    let cwd_unknown = inv.notes.iter().any(|n| n == UNKNOWN_CWD);
+    let relative = |p: &Path| !p.is_absolute() && !p.starts_with("~");
     let resolve_in = |p: &Path| resolve_path(p, &inv.cwd, &inv.home);
     match Cli::try_parse_from(&inv.argv) {
         Ok(cli) => {
-            if cli.command.is_some() {
+            if cli.command.is_some() || (cwd_unknown && relative(&cli.source)) {
                 return None;
             }
             let mut problems = Vec::new();
@@ -379,20 +578,7 @@ fn resolve(inv: Invocation) -> Option<Job> {
                 .map(resolve_in)
                 .unwrap_or_else(|| inv.home.join("backups"));
             let exclude_from = cli.exclude_from.as_deref().map(resolve_in);
-            let mut raw = cli.excludes.clone();
-            if let Some(path) = &exclude_from {
-                match read_exclude_file(path) {
-                    Ok(more) => raw.extend(more),
-                    Err(err) => problems.push(format!("{err:#}; the real run will fail here too")),
-                }
-            }
-            let mut excludes = Vec::new();
-            for r in raw {
-                match ExcludePattern::parse(&r) {
-                    Ok(p) => excludes.push((r, p)),
-                    Err(err) => problems.push(format!("{err:#}; the real run will refuse to start")),
-                }
-            }
+            let excludes = load_excludes(cli.excludes.clone(), exclude_from.as_deref(), &mut problems);
             let retention = match retention_policy(&cli) {
                 Ok(r) => Some(r),
                 Err(err) => {
@@ -416,32 +602,98 @@ fn resolve(inv: Invocation) -> Option<Job> {
             })
         }
         Err(err) => {
+            use clap::error::ErrorKind;
+            if matches!(
+                err.kind(),
+                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+            ) {
+                return None;
+            }
             // Flags this build does not know (an older or newer forever-ago).
-            // Still pull out --source so the job can be matched to a directory.
+            // A backup run names its source or prefix; anything else (a newer
+            // subcommand, say) is not a job.
+            let source = flag_value(&inv.argv, "--source");
+            let prefix = flag_value(&inv.argv, "--prefix");
+            if source.is_none() && prefix.is_none() {
+                return None;
+            }
+            let source = source.unwrap_or_else(|| ".".into());
+            if cwd_unknown && relative(Path::new(&source)) {
+                return None;
+            }
             let reason = err.to_string();
             let reason = reason.lines().next().unwrap_or("").trim_start_matches("error: ").to_string();
-            let source = flag_value(&inv.argv, "--source").unwrap_or_else(|| ".".into());
+            let mut problems = vec![format!(
+                "this build of forever-ago cannot parse the job's arguments ({reason}); details here are partial"
+            )];
             let dest_dir = flag_value(&inv.argv, "--dest-dir")
                 .map(|d| resolve_in(Path::new(&d)))
                 .unwrap_or_else(|| inv.home.join("backups"));
+            let exclude_from = flag_value(&inv.argv, "--exclude-from").map(|f| resolve_in(Path::new(&f)));
+            let excludes = load_excludes(flag_values(&inv.argv, "--exclude"), exclude_from.as_deref(), &mut problems);
             Some(Job {
                 source: resolve_in(Path::new(&source)),
                 dest_dir,
-                prefix: flag_value(&inv.argv, "--prefix"),
+                prefix,
                 once: inv.argv.iter().any(|a| a == "--once"),
-                run_now: false,
+                run_now: inv.argv.iter().any(|a| a == "--run-now"),
                 at: flag_value(&inv.argv, "--at").unwrap_or_else(|| "03:00".into()),
                 retention: None,
-                exclude_from: None,
-                excludes: Vec::new(),
-                problems: vec![format!(
-                    "this build of forever-ago cannot parse the job's arguments ({reason}); details below are partial"
-                )],
+                exclude_from,
+                excludes,
+                problems,
                 pids: Vec::new(),
                 inv,
             })
         }
     }
+}
+
+/// The job's excludes, parsed by the same rules the real run uses.
+fn load_excludes(mut raw: Vec<String>, exclude_from: Option<&Path>, problems: &mut Vec<String>) -> Vec<(String, ExcludePattern)> {
+    if let Some(path) = exclude_from {
+        match read_exclude_file(path) {
+            Ok(more) => raw.extend(more),
+            Err(err) => {
+                let kind = err.root_cause().downcast_ref::<std::io::Error>().map(std::io::Error::kind);
+                problems.push(match kind {
+                    // Not proof of a broken job: it may run as a user who can read it.
+                    Some(std::io::ErrorKind::PermissionDenied) => format!(
+                        "cannot read --exclude-from {} as you; its excludes are not shown",
+                        path.display()
+                    ),
+                    _ => format!("{err:#}; the real run will fail here too"),
+                });
+            }
+        }
+    }
+    raw.into_iter()
+        .filter_map(|r| match ExcludePattern::parse(&r) {
+            Ok(p) => Some((r, p)),
+            Err(err) => {
+                problems.push(format!("{err:#}; the real run will refuse to start"));
+                None
+            }
+        })
+        .collect()
+}
+
+fn flag_values(argv: &[String], flag: &str) -> Vec<String> {
+    let eq = format!("{flag}=");
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < argv.len() {
+        if argv[i] == flag {
+            out.extend(argv.get(i + 1).cloned());
+            i += 2;
+            continue;
+        }
+        if let Some(v) = argv[i].strip_prefix(&eq) {
+            out.push(v.to_string());
+        }
+        i += 1;
+    }
+    out
 }
 
 fn flag_value(argv: &[String], flag: &str) -> Option<String> {
@@ -457,29 +709,37 @@ fn flag_value(argv: &[String], flag: &str) -> Option<String> {
 
 // --- systemd -----------------------------------------------------------------
 
-/// `(section, key, value)` in file order, continuation lines joined.
-type UnitEntries = Vec<(String, String, String)>;
+struct Entry {
+    section: String,
+    key: String,
+    value: String,
+    /// Index into `UnitFile::files`: 0 is the unit file, the rest drop-ins.
+    file: usize,
+}
 
 struct UnitFile {
     name: String,
-    path: PathBuf,
-    entries: UnitEntries,
+    files: Vec<PathBuf>,
+    entries: Vec<Entry>,
 }
 
 impl UnitFile {
-    /// All values of a list-valued key, honouring systemd's "empty assignment resets the list".
-    fn list(&self, section: &str, key: &str) -> Vec<String> {
+    /// All values of a list-valued key, with the file each came from,
+    /// honouring systemd's "empty assignment resets the list".
+    fn list_from(&self, section: &str, key: &str) -> Vec<(String, usize)> {
         let mut out = Vec::new();
-        for (s, k, v) in &self.entries {
-            if s == section && k == key {
-                if v.is_empty() {
-                    out.clear();
-                } else {
-                    out.push(v.clone());
-                }
+        for e in self.entries.iter().filter(|e| e.section == section && e.key == key) {
+            if e.value.is_empty() {
+                out.clear();
+            } else {
+                out.push((e.value.clone(), e.file));
             }
         }
         out
+    }
+
+    fn list(&self, section: &str, key: &str) -> Vec<String> {
+        self.list_from(section, key).into_iter().map(|(v, _)| v).collect()
     }
 
     /// A single-valued key: the last assignment wins.
@@ -487,18 +747,22 @@ impl UnitFile {
         self.entries
             .iter()
             .rev()
-            .find(|(s, k, _)| s == section && k == key)
-            .map(|(_, _, v)| v.clone())
+            .find(|e| e.section == section && e.key == key)
+            .map(|e| e.value.clone())
             .filter(|v| !v.is_empty())
+    }
+
+    fn mentions(&self, needle: &str) -> bool {
+        self.entries.iter().any(|e| e.value.contains(needle))
     }
 }
 
-fn parse_unit_text(text: &str, out: &mut UnitEntries) {
-    fn push(section: &str, line: &str, out: &mut UnitEntries) {
+fn parse_unit_text(text: &str, file: usize, out: &mut Vec<Entry>) {
+    let push = |section: &str, line: &str, out: &mut Vec<Entry>| {
         if let Some((k, v)) = line.split_once('=') {
-            out.push((section.to_string(), k.trim().to_string(), v.trim().to_string()));
+            out.push(Entry { section: section.to_string(), key: k.trim().to_string(), value: v.trim().to_string(), file });
         }
-    }
+    };
 
     let mut section = String::new();
     let mut pending: Option<String> = None;
@@ -537,137 +801,341 @@ fn parse_unit_text(text: &str, out: &mut UnitEntries) {
     }
 }
 
-/// Load every unit with `suffix` from a search path: earlier directories win,
-/// masked units are skipped, drop-ins are applied in filename order.
-fn load_units(dirs: &[PathBuf], suffix: &str) -> Vec<UnitFile> {
-    let mut found: BTreeMap<String, PathBuf> = BTreeMap::new();
-    for dir in dirs {
-        let Ok(rd) = fs::read_dir(dir) else { continue };
-        for entry in rd.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            // Templates (foo@.service) need an instance name to mean anything.
-            if name.ends_with(suffix) && !name.contains('@') {
-                found.entry(name).or_insert_with(|| entry.path());
-            }
-        }
-    }
-
-    let mut units = Vec::new();
-    for (name, path) in found {
-        if fs::canonicalize(&path).is_ok_and(|p| p == Path::new("/dev/null")) {
-            continue; // masked
-        }
-        let Ok(text) = fs::read_to_string(&path) else { continue };
-        if text.trim().is_empty() {
-            continue;
-        }
-        let mut entries = Vec::new();
-        parse_unit_text(&text, &mut entries);
-
-        let mut dropins: BTreeMap<String, PathBuf> = BTreeMap::new();
-        for dir in dirs {
-            let Ok(rd) = fs::read_dir(dir.join(format!("{name}.d"))) else { continue };
-            for entry in rd.flatten() {
-                let fname = entry.file_name().to_string_lossy().into_owned();
-                if fname.ends_with(".conf") {
-                    dropins.entry(fname).or_insert_with(|| entry.path());
-                }
-            }
-        }
-        for dropin in dropins.values() {
-            if let Ok(text) = fs::read_to_string(dropin) {
-                parse_unit_text(&text, &mut entries);
-            }
-        }
-        units.push(UnitFile { name, path, entries });
-    }
-    units
-}
-
-/// Is `unit` pulled in by some target (`*.wants/` or `*.requires/` link)?
-fn unit_enabled_offline(dirs: &[PathBuf], unit: &str) -> bool {
-    dirs.iter().any(|dir| {
-        fs::read_dir(dir).is_ok_and(|rd| {
-            rd.flatten().any(|e| {
-                let n = e.file_name().to_string_lossy().into_owned();
-                (n.ends_with(".wants") || n.ends_with(".requires")) && e.path().join(unit).exists()
-            })
-        })
+/// `foo@bar.service` -> ("foo", Some("bar"), "service"); `foo.service` -> ("foo", None, "service").
+fn split_unit_name(name: &str) -> Option<(&str, Option<&str>, &str)> {
+    let (stem, kind) = name.rsplit_once('.')?;
+    Some(match stem.split_once('@') {
+        Some((prefix, instance)) => (prefix, Some(instance), kind),
+        None => (stem, None, kind),
     })
 }
 
-fn expand_specifiers(s: &str, unit: &str, home: &Path, user: &str) -> String {
+/// One systemd search path (earlier directories win), indexed by file name.
+struct UnitDirs<'a> {
+    dirs: &'a [PathBuf],
+    index: BTreeMap<String, PathBuf>,
+}
+
+impl<'a> UnitDirs<'a> {
+    fn new(dirs: &'a [PathBuf]) -> Self {
+        let mut index = BTreeMap::new();
+        for dir in dirs {
+            let Ok(rd) = fs::read_dir(dir) else { continue };
+            for entry in rd.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if split_unit_name(&name).is_some() && !entry.path().is_dir() {
+                    index.entry(name).or_insert_with(|| entry.path());
+                }
+            }
+        }
+        Self { dirs, index }
+    }
+
+    /// Every concrete unit of a kind worth looking at: plain units, plus
+    /// template instances that something enables (`timers.target.wants/
+    /// foo@bar.timer`). Templates themselves and alias symlinks are skipped;
+    /// the alias's target is listed under its own name.
+    fn names(&self, kind: &str) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .index
+            .iter()
+            .filter(|(name, path)| {
+                let Some((_, instance, k)) = split_unit_name(name) else { return false };
+                let alias = fs::read_link(path).is_ok_and(|t| t.file_name().is_some_and(|f| f != name.as_str()) && t != Path::new("/dev/null"));
+                k == kind && instance != Some("") && !alias
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+        for wants in self.wants_dirs() {
+            let Ok(rd) = fs::read_dir(&wants) else { continue };
+            for entry in rd.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if split_unit_name(&name).is_some_and(|(_, i, k)| k == kind && i.is_some_and(|i| !i.is_empty())) {
+                    out.push(name);
+                }
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    fn wants_dirs(&self) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        for dir in self.dirs {
+            let Ok(rd) = fs::read_dir(dir) else { continue };
+            for entry in rd.flatten() {
+                let n = entry.file_name().to_string_lossy().into_owned();
+                if n.ends_with(".wants") || n.ends_with(".requires") {
+                    out.push(entry.path());
+                }
+            }
+        }
+        out
+    }
+
+    /// Targets that pull `unit` in (`default.target.wants/unit`, ...).
+    fn wanted_by(&self, unit: &str) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .wants_dirs()
+            .into_iter()
+            .filter(|w| w.join(unit).exists())
+            .filter_map(|w| {
+                let n = w.file_name()?.to_string_lossy().into_owned();
+                Some(n.trim_end_matches(".wants").trim_end_matches(".requires").to_string())
+            })
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// The unit as systemd would load it: the instance file if one exists,
+    /// else its template; masked units are `None`; drop-ins are applied from
+    /// the least specific directory (`service.d`, then `foo-.service.d` prefix
+    /// dirs, then the template's, then the unit's own) with a same-named file
+    /// in a more specific or earlier directory overriding the rest.
+    fn load(&self, name: &str) -> Option<UnitFile> {
+        let (prefix, instance, kind) = split_unit_name(name)?;
+        let template = instance.map(|_| format!("{prefix}@.{kind}"));
+        let path = self.index.get(name).or_else(|| template.as_ref().and_then(|t| self.index.get(t)))?;
+        if fs::canonicalize(path).is_ok_and(|p| p == Path::new("/dev/null")) {
+            return None;
+        }
+        let text = fs::read_to_string(path).ok()?;
+        if text.trim().is_empty() {
+            return None;
+        }
+
+        let mut levels = vec![format!("{kind}.d")];
+        let dashes: Vec<usize> = prefix.match_indices('-').map(|(i, _)| i).collect();
+        for i in dashes {
+            levels.push(format!("{}-.{kind}.d", &prefix[..i]));
+        }
+        levels.extend(template.map(|t| format!("{t}.d")));
+        levels.push(format!("{name}.d"));
+        let mut dropins: BTreeMap<String, PathBuf> = BTreeMap::new();
+        for level in &levels {
+            for dir in self.dirs.iter().rev() {
+                let Ok(rd) = fs::read_dir(dir.join(level)) else { continue };
+                for entry in rd.flatten() {
+                    let fname = entry.file_name().to_string_lossy().into_owned();
+                    if fname.ends_with(".conf") {
+                        dropins.insert(fname, entry.path());
+                    }
+                }
+            }
+        }
+
+        let mut files = vec![path.clone()];
+        let mut entries = Vec::new();
+        parse_unit_text(&text, 0, &mut entries);
+        for dropin in dropins.into_values() {
+            if let Ok(text) = fs::read_to_string(&dropin) {
+                parse_unit_text(&text, files.len(), &mut entries);
+                files.push(dropin);
+            }
+        }
+        Some(UnitFile { name: name.to_string(), files, entries })
+    }
+}
+
+/// What systemd substitutes for `%x` in a unit, minus the per-unit parts.
+struct ManagerInfo {
+    user_scope: bool,
+    /// %h / %u: the user running the *manager*. For the system manager that is
+    /// root even when the unit says User= — systemd documents this explicitly.
+    home: PathBuf,
+    user: String,
+    uid: String,
+    runtime_dir: PathBuf,
+    host: String,
+}
+
+/// systemd-escape in reverse: `-` is `/`, `\xNN` is a byte.
+fn unescape_unit(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'-' => out.push(b'/'),
+            b'\\' if bytes.get(i + 1) == Some(&b'x') => {
+                if let Some(b) = s.get(i + 2..i + 4).and_then(|h| u8::from_str_radix(h, 16).ok()) {
+                    out.push(b);
+                    i += 4;
+                    continue;
+                }
+                out.push(b'\\');
+            }
+            b => out.push(b),
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Expand `%x` specifiers; returns the text and any specifier it could not resolve.
+fn expand_specifiers(s: &str, unit: &str, m: &ManagerInfo) -> (String, Vec<char>) {
+    let (prefix, instance, _) = split_unit_name(unit).unwrap_or((unit, None, ""));
+    let instance = instance.unwrap_or("");
     let stem = unit.rsplit_once('.').map_or(unit, |(stem, _)| stem);
+    let last_dash = |p: &str| p.rsplit_once('-').map_or(p, |(_, tail)| tail).to_string();
+    let (state, cache, logs, config) = if m.user_scope {
+        let h = &m.home;
+        (h.join(".local/state"), h.join(".cache"), h.join(".local/state/log"), h.join(".config"))
+    } else {
+        ("/var/lib".into(), "/var/cache".into(), "/var/log".into(), "/etc".into())
+    };
     let mut out = String::with_capacity(s.len());
+    let mut unknown = Vec::new();
     let mut chars = s.chars();
     while let Some(c) = chars.next() {
         if c != '%' {
             out.push(c);
             continue;
         }
-        match chars.next() {
-            Some('h') => out.push_str(&home.to_string_lossy()),
-            Some('u') => out.push_str(user),
-            Some('n') => out.push_str(unit),
-            Some('N') | Some('p') => out.push_str(stem),
-            Some('%') => out.push('%'),
-            Some(other) => {
+        let Some(spec) = chars.next() else {
+            out.push('%');
+            break;
+        };
+        let value: Option<String> = match spec {
+            '%' => Some("%".into()),
+            'n' => Some(unit.into()),
+            'N' => Some(stem.into()),
+            'p' => Some(prefix.into()),
+            'P' => Some(unescape_unit(prefix)),
+            'i' => Some(instance.into()),
+            'I' => Some(unescape_unit(instance)),
+            'j' => Some(last_dash(prefix)),
+            'J' => Some(unescape_unit(&last_dash(prefix))),
+            'f' => Some(format!("/{}", unescape_unit(if instance.is_empty() { prefix } else { instance }))),
+            'h' => Some(m.home.to_string_lossy().into_owned()),
+            'u' => Some(m.user.clone()),
+            'U' => Some(m.uid.clone()),
+            'H' => Some(m.host.clone()),
+            'l' => Some(m.host.split('.').next().unwrap_or("").into()),
+            't' => Some(m.runtime_dir.to_string_lossy().into_owned()),
+            'S' => Some(state.to_string_lossy().into_owned()),
+            'C' => Some(cache.to_string_lossy().into_owned()),
+            'L' => Some(logs.to_string_lossy().into_owned()),
+            'E' => Some(config.to_string_lossy().into_owned()),
+            'T' => Some("/tmp".into()),
+            'V' => Some("/var/tmp".into()),
+            _ => None,
+        };
+        match value {
+            Some(v) => out.push_str(&v),
+            None => {
+                unknown.push(spec);
                 out.push('%');
-                out.push(other);
+                out.push(spec);
             }
-            None => out.push('%'),
         }
     }
-    out
+    (out, unknown)
 }
+
+/// `EnvironmentFile=`: KEY=VALUE lines, `#`/`;` comments, optional quotes.
+fn read_env_file(path: &Path, vars: &mut HashMap<String, String>) {
+    let Ok(text) = fs::read_to_string(path) else { return };
+    for line in text.lines().map(str::trim) {
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        if let Some((k, v)) = line.split_once('=') {
+            let v = v.trim();
+            let v = v
+                .strip_prefix('"')
+                .and_then(|v| v.strip_suffix('"'))
+                .or_else(|| v.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
+                .unwrap_or(v);
+            vars.insert(k.trim().to_string(), v.to_string());
+        }
+    }
+}
+
+const TIMER_KEYS: &[&str] = &["OnCalendar", "OnBootSec", "OnStartupSec", "OnActiveSec", "OnUnitActiveSec", "OnUnitInactiveSec"];
+const PATH_KEYS: &[&str] = &["PathExists", "PathExistsGlob", "PathChanged", "PathModified", "DirectoryNotEmpty"];
 
 fn systemd_invocations(src: &Sources, scheduler: Scheduler) -> Vec<Invocation> {
     let user_scope = scheduler == Scheduler::SystemdUser;
-    let dirs = if user_scope { &src.user_unit_dirs } else { &src.system_unit_dirs };
+    let dirs = UnitDirs::new(if user_scope { &src.user_unit_dirs } else { &src.system_unit_dirs });
+    let manager = ManagerInfo {
+        user_scope,
+        home: if user_scope { src.home.clone() } else { PathBuf::from("/root") },
+        user: if user_scope { src.user.clone() } else { "root".into() },
+        uid: if user_scope { src.uid.clone() } else { "0".into() },
+        runtime_dir: if user_scope { src.runtime_dir.clone() } else { PathBuf::from("/run") },
+        host: src.host.clone(),
+    };
 
-    let services = load_units(dirs, ".service");
-    if !services
-        .iter()
-        .any(|u| u.entries.iter().any(|(_, _, v)| v.contains(BIN)))
-    {
-        return Vec::new();
+    // What starts each service: timers and path units (Unit=, defaulting to
+    // the same name), including enabled instances of templated ones.
+    let mut triggers_for: BTreeMap<String, Vec<UnitFile>> = BTreeMap::new();
+    for kind in ["timer", "path"] {
+        for name in dirs.names(kind) {
+            let Some(unit) = dirs.load(&name) else { continue };
+            let section = if kind == "timer" { "Timer" } else { "Path" };
+            let target = unit
+                .last(section, "Unit")
+                .map(|u| expand_specifiers(&u, &name, &manager).0)
+                .unwrap_or_else(|| format!("{}.service", name.trim_end_matches(&format!(".{kind}"))));
+            triggers_for.entry(target).or_default().push(unit);
+        }
     }
 
-    // timer -> the service it starts (Unit=, defaulting to the same stem).
-    let mut timers_for: HashMap<String, Vec<UnitFile>> = HashMap::new();
-    for timer in load_units(dirs, ".timer") {
-        let target = timer.last("Timer", "Unit").unwrap_or_else(|| {
-            format!("{}.service", timer.name.trim_end_matches(".timer"))
-        });
-        timers_for.entry(target).or_default().push(timer);
-    }
+    let mut services = dirs.names("service");
+    services.extend(triggers_for.keys().cloned());
+    services.sort();
+    services.dedup();
 
-    let me = std::env::var("USER").unwrap_or_default();
     let mut out = Vec::new();
-    for svc in services {
-        let user = svc.last("Service", "User");
-        let (home, user_name) = if user_scope {
-            (src.home.clone(), me.clone())
-        } else {
-            match &user {
-                Some(u) => (src.home_of(u).unwrap_or_else(|| PathBuf::from("/")), u.clone()),
-                None => (PathBuf::from("/root"), "root".to_string()),
+    for name in services {
+        let Some(svc) = dirs.load(&name) else { continue };
+        if !svc.mentions(BIN) {
+            continue;
+        }
+        let mut notes = Vec::new();
+        let spec = |s: &str, notes: &mut Vec<String>| {
+            let (text, unknown) = expand_specifiers(s, &name, &manager);
+            for u in unknown {
+                notes.push(format!("uses the systemd specifier %{u}, shown unexpanded"));
             }
+            text
         };
-        let spec = |s: &str| expand_specifiers(s, &svc.name, &home, &user_name);
 
+        // The job's own user: what `~`, $HOME and the default --dest-dir mean.
+        let run_as = if user_scope { None } else { svc.last("Service", "User").map(|u| spec(&u, &mut notes)) };
+        let home = match &run_as {
+            _ if user_scope => src.home.clone(),
+            Some(u) => src.home_of(u).unwrap_or_else(|| PathBuf::from("/")),
+            None => PathBuf::from("/root"),
+        };
+
+        // Environment the manager provides, then Environment=, then
+        // EnvironmentFile= (which overrides, as in systemd).
         let mut vars: HashMap<String, String> = HashMap::new();
+        if let Some(user) = if user_scope { Some(src.user.clone()) } else { run_as.clone() } {
+            vars.insert("HOME".into(), home.to_string_lossy().into_owned());
+            vars.insert("USER".into(), user.clone());
+            vars.insert("LOGNAME".into(), user);
+        }
         for assignment in svc.list("Service", "Environment") {
-            for word in tokenize(&spec(&assignment)) {
+            for word in tokenize(&spec(&assignment, &mut notes)) {
                 if let Some((k, v)) = word.split_once('=') {
                     vars.insert(k.to_string(), v.to_string());
                 }
             }
         }
+        for file in svc.list("Service", "EnvironmentFile") {
+            let file = spec(file.trim_start_matches('-'), &mut notes);
+            read_env_file(Path::new(&file), &mut vars);
+        }
 
         let base_cwd = match svc.last("Service", "WorkingDirectory") {
             Some(wd) => {
-                let wd = spec(wd.trim_start_matches('-'));
+                let wd = spec(wd.trim_start_matches('-'), &mut notes);
                 if wd == "~" { home.clone() } else { PathBuf::from(wd) }
             }
             // systemd's default: the user's home for user managers, / for the system one.
@@ -675,47 +1143,55 @@ fn systemd_invocations(src: &Sources, scheduler: Scheduler) -> Vec<Invocation> {
             None => PathBuf::from("/"),
         };
 
-        let starts: Vec<(Option<Vec<String>>, Vec<String>)> = svc
-            .list("Service", "ExecStart")
+        let starts: Vec<(Found, usize)> = svc
+            .list_from("Service", "ExecStart")
             .iter()
-            .filter_map(|line| find_invocation(&strip_exec_prefixes(tokenize(&spec(line))), 0))
+            .filter_map(|(line, file)| {
+                let words = strip_exec_prefixes(split_words(&spec(line, &mut notes), false));
+                find_invocation(&words, 0).map(|f| (f, *file))
+            })
             .collect();
         let count = starts.len();
 
-        for (n, (cds, argv)) in starts.into_iter().enumerate() {
-            let name = if count > 1 { format!("{} (ExecStart #{})", svc.name, n + 1) } else { svc.name.clone() };
-            let argv: Vec<String> = argv.iter().map(|a| expand_vars(a, &vars)).collect();
-            let cwd = apply_cds(&base_cwd, cds.as_deref(), &home, &vars);
-            let mut inv = Invocation::new(scheduler, name, svc.path.display().to_string(), argv, cwd, home.clone());
-            inv.units.push(svc.name.clone());
+        let triggers = triggers_for.get(&name).map(Vec::as_slice).unwrap_or(&[]);
+        let wanted_by = dirs.wanted_by(&name);
+        for (n, (found, file)) in starts.into_iter().enumerate() {
+            let label = if count > 1 { format!("{name} (ExecStart #{})", n + 1) } else { name.clone() };
+            let mut notes = notes.clone();
+            let argv = expand_words(&found.words, &vars, false, &mut notes);
+            let cwd = apply_cds(&base_cwd, &found.cds, &home, &vars);
+            let mut defined_in = svc.files[0].display().to_string();
+            if file > 0 {
+                defined_in.push_str(&format!(" (ExecStart from {})", svc.files[file].display()));
+            }
+            let mut inv = Invocation::new(scheduler, label, defined_in, argv, cwd, home.clone());
+            inv.notes = notes;
+            inv.units.push(name.clone());
 
-            let timers = timers_for.get(&svc.name).map(Vec::as_slice).unwrap_or(&[]);
-            for timer in timers {
-                inv.units.push(timer.name.clone());
-                for key in [
-                    "OnCalendar",
-                    "OnBootSec",
-                    "OnStartupSec",
-                    "OnActiveSec",
-                    "OnUnitActiveSec",
-                    "OnUnitInactiveSec",
-                ] {
-                    for value in timer.list("Timer", key) {
+            for trigger in triggers {
+                inv.units.push(trigger.name.clone());
+                let (section, keys) = if trigger.name.ends_with(".timer") { ("Timer", TIMER_KEYS) } else { ("Path", PATH_KEYS) };
+                for key in keys {
+                    for value in trigger.list(section, key) {
                         inv.triggers.push(format!("{key}={value}"));
                     }
                 }
-                if timer.last("Timer", "Persistent").is_some_and(|v| is_truthy(&v)) {
+                if trigger.last("Timer", "Persistent").is_some_and(|v| is_truthy(&v)) {
                     inv.trigger_notes.push("catches up after downtime".into());
                 }
-                if let Some(delay) = timer.last("Timer", "RandomizedDelaySec") {
+                if let Some(delay) = trigger.last("Timer", "RandomizedDelaySec") {
                     inv.trigger_notes.push(format!("random delay up to {delay}"));
                 }
             }
-            inv.enabled = Some(if timers.is_empty() {
-                unit_enabled_offline(dirs, &svc.name)
+            if triggers.is_empty() {
+                // No timer: a unit some target wants still runs, once per boot/login.
+                for target in &wanted_by {
+                    inv.triggers.push(format!("whenever {target} starts"));
+                }
+                inv.enabled = Some(!wanted_by.is_empty());
             } else {
-                timers.iter().any(|t| unit_enabled_offline(dirs, &t.name))
-            });
+                inv.enabled = Some(triggers.iter().any(|t| !dirs.wanted_by(&t.name).is_empty()));
+            }
             out.push(inv);
         }
     }
@@ -728,15 +1204,15 @@ fn is_truthy(v: &str) -> bool {
 
 /// `ExecStart=-/usr/bin/foo` and friends: strip systemd's exec prefixes. With
 /// `@`, the second word is argv[0] rather than a real argument, so drop it.
-fn strip_exec_prefixes(mut argv: Vec<String>) -> Vec<String> {
-    let Some(first) = argv.first_mut() else { return argv };
-    let n = first.chars().take_while(|c| "@-:+!|".contains(*c)).count();
-    let had_at = first[..n].contains('@');
-    first.replace_range(..n, "");
-    if had_at && argv.len() > 1 {
-        argv.remove(1);
+fn strip_exec_prefixes(mut words: Vec<Word>) -> Vec<Word> {
+    let Some(first) = words.first_mut() else { return words };
+    let n = first.text.chars().take_while(|c| "@-:+!|".contains(*c)).count();
+    let had_at = first.text[..n].contains('@');
+    first.text.replace_range(..n, "");
+    if had_at && words.len() > 1 {
+        words.remove(1);
     }
-    argv
+    words
 }
 
 /// Ask systemctl for next/last run and whether the units are really live.
@@ -855,17 +1331,20 @@ fn parse_crontab(text: &str, origin: &str, has_user_field: bool, src: &Sources) 
             continue;
         };
         let user = if has_user_field { fields.pop() } else { None };
-        let home = match user {
+        let passwd_home = match user {
             Some(u) => src.home_of(u).unwrap_or_else(|| PathBuf::from("/")),
             None => src.home.clone(),
         };
         let mut vars = vars.clone();
-        vars.entry("HOME".into()).or_insert_with(|| home.to_string_lossy().into_owned());
+        vars.entry("HOME".into()).or_insert_with(|| passwd_home.to_string_lossy().into_owned());
+        // cron starts every command in $HOME, which a `HOME=` line in the
+        // crontab overrides, and the shell expands `~` from it too.
+        let home = PathBuf::from(&vars["HOME"]);
 
-        let Some((cds, argv)) = find_invocation(&tokenize(command), 0) else { continue };
-        let argv: Vec<String> = argv.iter().map(|a| expand_vars(a, &vars)).collect();
-        // cron starts every command in the owner's home directory.
-        let cwd = apply_cds(&home, cds.as_deref(), &home, &vars);
+        let Some(found) = find_invocation(&split_words(command, true), 0) else { continue };
+        let mut notes = Vec::new();
+        let argv = expand_words(&found.words, &vars, true, &mut notes);
+        let cwd = apply_cds(&home, &found.cds, &home, &vars);
         let mut inv = Invocation::new(
             Scheduler::Cron,
             format!("{origin}, line {}", idx + 1),
@@ -874,6 +1353,7 @@ fn parse_crontab(text: &str, origin: &str, has_user_field: bool, src: &Sources) 
             cwd,
             home,
         );
+        inv.notes = notes;
         inv.triggers.push(fields.join(" "));
         inv.enabled = Some(true);
         out.push(inv);
@@ -929,11 +1409,13 @@ fn parse_pm2_dump(text: &str, origin: &str, home: &Path) -> Result<Vec<Invocatio
         let cwd = get("pm_cwd").or_else(|| get("cwd")).map_or_else(|| home.to_path_buf(), PathBuf::from);
         let name = get("name").unwrap_or(BIN).to_string();
         let mut inv = Invocation::new(Scheduler::Pm2, name, origin.to_string(), argv, cwd, home.to_path_buf());
-        if let Some(cron) = get("cron_restart") {
+        // pm2 fires cron_restart even for a stopped app; "0" disables it.
+        let cron = get("cron_restart").filter(|c| *c != "0");
+        if let Some(cron) = cron {
             inv.triggers.push(format!("cron_restart {cron}"));
         }
         if let Some(status) = get("status") {
-            inv.enabled = Some(status == "online");
+            inv.enabled = Some(status == "online" || cron.is_some());
             inv.state.push(("pm2 status".into(), format!("{status} (as of the last `pm2 save`)")));
         }
         out.push(inv);
@@ -971,7 +1453,10 @@ fn scan_processes(proc_root: &Path, src: &Sources) -> Vec<(u32, Invocation)> {
             })
             .and_then(|uid| src.home_of(&uid))
             .unwrap_or_else(|| src.home.clone());
-        let cwd = fs::read_link(dir.join("cwd")).unwrap_or_else(|_| home.clone());
+        // Another user's daemon hides its cwd. Inventing one (their home)
+        // would fabricate a job; resolve() drops it if a relative path needs it.
+        let cwd_known = fs::read_link(dir.join("cwd")).ok();
+        let cwd = cwd_known.clone().unwrap_or_default();
         let mut inv = Invocation::new(
             Scheduler::Daemon,
             format!("pid {pid}"),
@@ -981,6 +1466,9 @@ fn scan_processes(proc_root: &Path, src: &Sources) -> Vec<(u32, Invocation)> {
             home,
         );
         inv.state.push(("pid".into(), pid.to_string()));
+        if cwd_known.is_none() {
+            inv.notes.push(UNKNOWN_CWD.into());
+        }
         out.push((pid, inv));
     }
     out
@@ -990,17 +1478,54 @@ fn scan_processes(proc_root: &Path, src: &Sources) -> Vec<(u32, Invocation)> {
 // Command-line archaeology
 // ---------------------------------------------------------------------------
 
+/// One word of a command line. `quoted` words are never word-split when
+/// expanded; `op` marks unquoted shell operators (`&&`, `;`, `(`, ...).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Word {
+    text: String,
+    quoted: bool,
+    op: bool,
+}
+
 /// Split a command line into words: single and double quotes, backslash
-/// escapes. Enough for unit files, crontabs, and `sh -c` strings.
-fn tokenize(s: &str) -> Vec<String> {
+/// escapes, operators even when glued (`cd /x;forever-ago`). `shell` adds what
+/// only a shell does: `#` comments and `( ... )` subshells. `$(...)` and
+/// backticks are kept verbatim inside their word.
+fn split_words(s: &str, shell: bool) -> Vec<Word> {
     let mut out = Vec::new();
     let mut cur = String::new();
     let mut in_word = false;
+    let mut quoted = false;
     let mut chars = s.chars().peekable();
+
+    fn flush(out: &mut Vec<Word>, cur: &mut String, in_word: &mut bool, quoted: &mut bool) {
+        if *in_word {
+            out.push(Word { text: std::mem::take(cur), quoted: *quoted, op: false });
+        }
+        *in_word = false;
+        *quoted = false;
+    }
+    // Copy a `$( ... )` or `` `...` `` through its closing delimiter.
+    fn substitution(chars: &mut std::iter::Peekable<std::str::Chars>, cur: &mut String, close: char) {
+        let mut depth = 1;
+        for c in chars.by_ref() {
+            cur.push(c);
+            if close == ')' && c == '(' {
+                depth += 1;
+            } else if c == close {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+        }
+    }
+
     while let Some(c) = chars.next() {
         match c {
             '\'' => {
                 in_word = true;
+                quoted = true;
                 for c in chars.by_ref() {
                     if c == '\'' {
                         break;
@@ -1010,11 +1535,21 @@ fn tokenize(s: &str) -> Vec<String> {
             }
             '"' => {
                 in_word = true;
+                quoted = true;
                 while let Some(c) = chars.next() {
                     match c {
                         '"' => break,
                         '\\' if matches!(chars.peek(), Some('"' | '\\' | '$' | '`')) => {
                             cur.extend(chars.next());
+                        }
+                        '$' if chars.peek() == Some(&'(') => {
+                            cur.push(c);
+                            cur.extend(chars.next());
+                            substitution(&mut chars, &mut cur, ')');
+                        }
+                        '`' => {
+                            cur.push(c);
+                            substitution(&mut chars, &mut cur, '`');
                         }
                         _ => cur.push(c),
                     }
@@ -1024,44 +1559,46 @@ fn tokenize(s: &str) -> Vec<String> {
                 in_word = true;
                 cur.extend(chars.next());
             }
+            '$' if chars.peek() == Some(&'(') => {
+                in_word = true;
+                cur.push(c);
+                cur.extend(chars.next());
+                substitution(&mut chars, &mut cur, ')');
+            }
+            '`' => {
+                in_word = true;
+                cur.push(c);
+                substitution(&mut chars, &mut cur, '`');
+            }
+            '#' if shell && !in_word => break,
             // `2>&1` is a redirection, not a background `&`.
             '&' if cur.ends_with(['>', '<']) => cur.push(c),
-            // Operators split words even when glued: `cd /x; forever-ago`.
-            ';' | '&' | '|' => {
-                if in_word {
-                    out.push(std::mem::take(&mut cur));
-                    in_word = false;
-                }
+            ';' | '&' | '|' | '(' | ')' if c != '(' && c != ')' || shell => {
+                flush(&mut out, &mut cur, &mut in_word, &mut quoted);
                 let mut op = c.to_string();
                 if (c == '&' && chars.peek() == Some(&'&')) || (c == '|' && matches!(chars.peek(), Some('|' | '&'))) {
                     op.extend(chars.next());
                 }
-                out.push(op);
+                out.push(Word { text: op, quoted: false, op: true });
             }
-            c if c.is_whitespace() => {
-                if in_word {
-                    out.push(std::mem::take(&mut cur));
-                    in_word = false;
-                }
-            }
+            c if c.is_whitespace() => flush(&mut out, &mut cur, &mut in_word, &mut quoted),
             _ => {
                 in_word = true;
                 cur.push(c);
             }
         }
     }
-    if in_word {
-        out.push(cur);
-    }
+    flush(&mut out, &mut cur, &mut in_word, &mut quoted);
     out
+}
+
+/// Just the words, for values that are not commands (Environment=, pm2 args).
+fn tokenize(s: &str) -> Vec<String> {
+    split_words(s, false).into_iter().map(|w| w.text).collect()
 }
 
 fn basename(word: &str) -> &str {
     word.rsplit('/').next().unwrap_or(word)
-}
-
-fn is_operator(word: &str) -> bool {
-    matches!(word, "&&" | "||" | ";" | "|" | "&" | "|&")
 }
 
 fn is_redirect(word: &str) -> bool {
@@ -1071,66 +1608,144 @@ fn is_redirect(word: &str) -> bool {
 
 fn is_assignment(word: &str) -> bool {
     word.split_once('=').is_some_and(|(k, _)| {
-        !k.is_empty() && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        !k.is_empty()
+            && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            && !k.starts_with(|c: char| c.is_ascii_digit())
     })
 }
 
-/// Find the forever-ago command inside a command line. Returns any `cd DIR`
-/// that runs before it (so relative paths resolve correctly) and its argv,
-/// cut off at the first shell operator or redirection.
-///
-/// Only a word in command position counts — first word, after an operator,
-/// after `VAR=x` assignments, or handed to a wrapper like `nice`/`flock` — so
-/// `restic backup ~/code/forever-ago` is not mistaken for a job.
-fn find_invocation(words: &[String], depth: u8) -> Option<(Option<Vec<String>>, Vec<String>)> {
+/// Shell words that leave the next word in command position.
+const SHELL_KEYWORDS: &[&str] = &["if", "then", "else", "elif", "do", "while", "until", "!", "{", "}"];
+
+/// A forever-ago command found inside a command line: any `cd DIR` that runs
+/// before it (so relative paths resolve correctly), and its words, cut off at
+/// the first shell operator or redirection.
+#[derive(Debug, PartialEq, Eq)]
+struct Found {
+    cds: Vec<String>,
+    words: Vec<Word>,
+}
+
+/// Find the forever-ago command in a command line. Only a word in command
+/// position counts: the first word, after an operator or keyword, after
+/// `VAR=x` assignments, or the command a wrapper like `nice`/`flock` runs.
+/// So `restic backup ~/code/forever-ago` and `flock /run/lock/forever-ago
+/// restic ...` are not mistaken for jobs.
+fn find_invocation(words: &[Word], depth: u8) -> Option<Found> {
+    if depth > 3 {
+        return None;
+    }
     let mut cds: Vec<String> = Vec::new();
     let mut command_position = true;
-    let mut wrapped = false;
     let mut i = 0;
     while i < words.len() {
-        let w = words[i].as_str();
-        if is_operator(w) {
+        let w = &words[i];
+        if w.op {
             command_position = true;
-            wrapped = false;
             i += 1;
             continue;
         }
-        if command_position && is_assignment(w) {
+        if !command_position {
             i += 1;
             continue;
         }
-        let name = basename(w);
-        let runnable = name == BIN && !w.ends_with('/') && !Path::new(w).is_dir();
-        if runnable && (command_position || (wrapped && !is_assignment(w))) {
-            let argv: Vec<String> = words[i..]
+        if (!w.quoted && SHELL_KEYWORDS.contains(&w.text.as_str())) || is_assignment(&w.text) {
+            i += 1;
+            continue;
+        }
+        let name = basename(&w.text);
+        if name == BIN && !w.text.ends_with('/') {
+            let words = words[i..]
                 .iter()
-                .take_while(|a| !is_operator(a) && !is_redirect(a))
+                .take_while(|a| !a.op && !(is_redirect(&a.text) && !a.quoted))
                 .cloned()
                 .collect();
-            return Some(((!cds.is_empty()).then_some(cds), argv));
+            return Some(Found { cds, words });
         }
-        if command_position {
-            if SHELLS.contains(&name) && depth < 3 {
-                let script = words[i + 1..]
-                    .iter()
-                    .position(|a| a == "-c" || (a.starts_with('-') && !a.starts_with("--") && a.ends_with('c')))
-                    .and_then(|p| words.get(i + 1 + p + 1));
-                if let Some(script) = script
-                    && let Some((inner_cds, argv)) = find_invocation(&tokenize(script), depth + 1)
-                {
-                    cds.extend(inner_cds.unwrap_or_default());
-                    return Some(((!cds.is_empty()).then_some(cds), argv));
+        if name == "cd" {
+            cds.push(words.get(i + 1).filter(|a| !a.op).map_or_else(|| "~".into(), |a| a.text.clone()));
+        }
+        if SHELLS.contains(&name) {
+            let script = words[i + 1..]
+                .iter()
+                .take_while(|a| !a.op)
+                .position(|a| a.text == "-c" || (a.text.starts_with('-') && !a.text.starts_with("--") && a.text.ends_with('c')))
+                .and_then(|p| words.get(i + 1 + p + 1));
+            if let Some(script) = script
+                && let Some(found) = find_invocation(&split_words(&script.text, true), depth + 1)
+            {
+                cds.extend(found.cds);
+                return Some(Found { cds, words: found.words });
+            }
+        }
+        if let Some(wrapper) = WRAPPERS.iter().find(|wr| wr.name == name) {
+            match step_over(wrapper, words, i + 1, depth, &mut cds) {
+                Step::Command(next) => {
+                    i = next; // still in command position
+                    continue;
                 }
+                Step::Found(found) => {
+                    cds.extend(found.cds);
+                    return Some(Found { cds, words: found.words });
+                }
+                Step::Nothing => {}
             }
-            if name == "cd" {
-                cds.push(words.get(i + 1).filter(|a| !is_operator(a)).cloned().unwrap_or_else(|| "~".into()));
-            }
-            wrapped = WRAPPERS.contains(&name);
-            command_position = false;
         }
+        command_position = false;
         i += 1;
     }
     None
+}
+
+enum Step {
+    /// Index of the command the wrapper runs.
+    Command(usize),
+    /// The wrapper runs a whole command line (`flock -c "..."`) and forever-ago is in it.
+    Found(Found),
+    Nothing,
+}
+
+fn step_over(wrapper: &Wrapper, words: &[Word], mut i: usize, depth: u8, cds: &mut Vec<String>) -> Step {
+    let mut positionals = wrapper.positionals;
+    while i < words.len() && !words[i].op {
+        let w = words[i].text.as_str();
+        if w == "--" {
+            return Step::Command(i + 1);
+        }
+        // --opt=value
+        let (opt, inline) = match w.split_once('=') {
+            Some((o, v)) if o.starts_with("--") => (o, Some(v)),
+            _ => (w, None),
+        };
+        if opt.starts_with('-') {
+            let takes_value = wrapper.value_opts.contains(&opt);
+            let value = inline.map(str::to_string).or_else(|| takes_value.then(|| words.get(i + 1).map(|v| v.text.clone())).flatten());
+            if let Some(value) = &value {
+                if wrapper.command_opts.contains(&opt) {
+                    if let Some(found) = find_invocation(&split_words(value, true), depth + 1) {
+                        return Step::Found(found);
+                    }
+                    return Step::Nothing;
+                }
+                if wrapper.chdir_opts.contains(&opt) {
+                    cds.push(value.clone());
+                }
+            }
+            i += if takes_value && inline.is_none() { 2 } else { 1 };
+            continue;
+        }
+        if wrapper.name == "env" && is_assignment(w) {
+            i += 1;
+            continue;
+        }
+        if positionals > 0 {
+            positionals -= 1;
+            i += 1;
+            continue;
+        }
+        return Step::Command(i);
+    }
+    Step::Nothing
 }
 
 fn expand_vars(word: &str, vars: &HashMap<String, String>) -> String {
@@ -1160,9 +1775,71 @@ fn expand_vars(word: &str, vars: &HashMap<String, String>) -> String {
     out
 }
 
-fn apply_cds(base: &Path, cds: Option<&[String]>, home: &Path, vars: &HashMap<String, String>) -> PathBuf {
+/// Expand variables in a found command the way its runner would. An unquoted
+/// word that is exactly `$VAR` (or `${VAR}` in a shell) becomes several
+/// arguments; anything left unexpandable is noted rather than guessed at.
+fn expand_words(words: &[Word], vars: &HashMap<String, String>, shell: bool, notes: &mut Vec<String>) -> Vec<String> {
+    let mut out = Vec::new();
+    for w in words {
+        if !w.quoted
+            && let Some(name) = whole_var(&w.text, shell)
+            && let Some(value) = vars.get(name)
+        {
+            out.extend(tokenize(value));
+            continue;
+        }
+        let text = expand_hostname(&expand_vars(&w.text, vars));
+        if text.contains("$(") || text.contains('`') {
+            notes.push(format!("`{text}` uses command substitution, shown unexpanded"));
+        } else if has_unresolved_var(&text) {
+            notes.push(format!("`{text}` uses a variable only set at run time, shown unexpanded"));
+        }
+        out.push(text);
+    }
+    out
+}
+
+/// `$NAME`, or `${NAME}` in a shell (systemd keeps braced variables as one word).
+fn whole_var(text: &str, shell: bool) -> Option<&str> {
+    let rest = text.strip_prefix('$')?;
+    let name = match rest.strip_prefix('{') {
+        Some(inner) if shell => inner.strip_suffix('}')?,
+        Some(_) => return None,
+        None => rest,
+    };
+    (!name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')).then_some(name)
+}
+
+fn has_unresolved_var(text: &str) -> bool {
+    text.match_indices('$')
+        .any(|(i, _)| text[i + 1..].starts_with(|c: char| c == '{' || c == '_' || c.is_ascii_alphabetic()))
+}
+
+/// The one command substitution worth resolving: the README's own
+/// `--prefix name-$(hostname)`.
+fn expand_hostname(text: &str) -> String {
+    if !text.contains("hostname") && !text.contains("uname -n") {
+        return text.to_string();
+    }
+    let host = hostname();
+    let short = host.split('.').next().unwrap_or(&host).to_string();
+    let mut out = text.to_string();
+    for (pattern, value) in [
+        ("$(hostname -s)", &short),
+        ("`hostname -s`", &short),
+        ("$(hostname)", &host),
+        ("`hostname`", &host),
+        ("$(uname -n)", &host),
+        ("`uname -n`", &host),
+    ] {
+        out = out.replace(pattern, value);
+    }
+    out
+}
+
+fn apply_cds(base: &Path, cds: &[String], home: &Path, vars: &HashMap<String, String>) -> PathBuf {
     let mut cwd = base.to_path_buf();
-    for dir in cds.unwrap_or_default() {
+    for dir in cds {
         cwd = resolve_path(Path::new(&expand_vars(dir, vars)), &cwd, home);
     }
     cwd
@@ -1206,15 +1883,18 @@ pub(crate) fn canonical_or_normalized(path: &Path) -> PathBuf {
 // Rendering
 // ---------------------------------------------------------------------------
 
+/// `~/x` for paths under home, whether spelled through a symlinked $HOME or
+/// its canonical target.
 pub(crate) fn tilde(path: &Path, home: &Path) -> String {
-    match path.strip_prefix(home) {
+    let canonical = canonical_or_normalized(home);
+    match path.strip_prefix(home).or_else(|_| path.strip_prefix(&canonical)) {
         Ok(rest) if rest.as_os_str().is_empty() => "~".to_string(),
         Ok(rest) => format!("~/{}", rest.display()),
         Err(_) => path.display().to_string(),
     }
 }
 
-fn render_group(source: &Path, jobs: &[&Job], home: &Path, cwd: Option<&Path>) -> String {
+fn render_group(source: &Path, jobs: &[&Job], home: &Path) -> String {
     let mut out = format!(
         "{}  ({} job{})\n",
         tilde(source, home),
@@ -1223,14 +1903,18 @@ fn render_group(source: &Path, jobs: &[&Job], home: &Path, cwd: Option<&Path>) -
     );
     for job in jobs {
         out.push('\n');
-        out.push_str(&render_job(job, home, cwd));
+        out.push_str(&render_job(job, home));
     }
     out
 }
 
-fn render_job(job: &Job, home: &Path, cwd: Option<&Path>) -> String {
+fn render_job(job: &Job, home: &Path) -> String {
     let inv = &job.inv;
     let mut rows: Vec<(String, String)> = Vec::new();
+    // Caveats first: they qualify everything below them.
+    for p in inv.notes.iter().chain(&job.problems) {
+        rows.push(("problem".into(), p.clone()));
+    }
 
     let mut schedule: Vec<String> = Vec::new();
     if !inv.triggers.is_empty() {
@@ -1248,7 +1932,7 @@ fn render_job(job: &Job, home: &Path, cwd: Option<&Path>) -> String {
         schedule.push(s);
     }
     if schedule.is_empty() {
-        schedule.push("NONE: a one-shot (--once) with no timer; runs only when started by hand".into());
+        schedule.push("NONE: a one-shot (--once) that nothing triggers; runs only when started by hand".into());
     }
     for s in schedule {
         rows.push(("schedule".into(), s));
@@ -1260,7 +1944,15 @@ fn render_job(job: &Job, home: &Path, cwd: Option<&Path>) -> String {
             Scheduler::SystemdUser | Scheduler::SystemdSystem => "its unit is not enabled/active",
             _ => "the scheduler has it disabled",
         };
-        rows.push(("WARNING".into(), format!("will not fire: {why}")));
+        if !job.once && !job.pids.is_empty() {
+            // The daemon loop is the schedule, and it is running right now.
+            rows.push((
+                "note".into(),
+                format!("{why}, but the running daemon still backs up daily at {}; it will not come back after it stops", job.at),
+            ));
+        } else {
+            rows.push(("WARNING".into(), format!("will not fire: {why}")));
+        }
     }
     rows.extend(inv.state.iter().cloned());
     if !job.pids.is_empty() && inv.scheduler != Scheduler::Daemon {
@@ -1290,18 +1982,6 @@ fn render_job(job: &Job, home: &Path, cwd: Option<&Path>) -> String {
     }
     rows.push(("defined in".into(), tilde(Path::new(&inv.defined_in), home)));
 
-    if let Some(cwd) = cwd
-        && let Some(pattern) = excluded_by(job, cwd)
-    {
-        rows.push((
-            "NOTE".into(),
-            format!("{} is excluded by `{pattern}` and is NOT in these backups", tilde(cwd, home)),
-        ));
-    }
-    for p in &job.problems {
-        rows.push(("problem".into(), p.clone()));
-    }
-
     let mut out = format!("  {}  [{}]\n", inv.name, inv.scheduler.label());
     for (label, value) in rows {
         out.push_str(&format!("    {label:<11}{value}\n"));
@@ -1310,7 +1990,7 @@ fn render_job(job: &Job, home: &Path, cwd: Option<&Path>) -> String {
 }
 
 /// If `cwd` (inside the job's source) is pruned by an exclude, which pattern did it.
-fn excluded_by<'a>(job: &'a Job, cwd: &Path) -> Option<&'a str> {
+pub(crate) fn excluded_by<'a>(job: &'a Job, cwd: &Path) -> Option<&'a str> {
     let rel = cwd.strip_prefix(&job.source).ok()?;
     // Check every ancestor too: an excluded directory takes its whole subtree with it.
     let mut prefix = PathBuf::new();
@@ -1324,8 +2004,12 @@ fn excluded_by<'a>(job: &'a Job, cwd: &Path) -> Option<&'a str> {
 }
 
 fn describe_backups(dest_dir: &Path, prefix: &str) -> String {
-    let Ok(rd) = fs::read_dir(dest_dir) else {
-        return "nothing yet (destination does not exist)".to_string();
+    let rd = match fs::read_dir(dest_dir) {
+        Ok(rd) => rd,
+        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+            return "cannot read the destination as you; not checked".to_string();
+        }
+        Err(_) => return "nothing yet (destination does not exist)".to_string(),
     };
     let mut backups: Vec<(chrono::NaiveDate, String, u64)> = rd
         .flatten()
@@ -1339,10 +2023,10 @@ fn describe_backups(dest_dir: &Path, prefix: &str) -> String {
     match backups.last() {
         None => "no backups yet".to_string(),
         Some((_, name, size)) => format!(
-            "{} backup{}, newest {name} ({:.1} MB)",
+            "{} backup{}, newest {name} ({})",
             backups.len(),
             if backups.len() == 1 { "" } else { "s" },
-            *size as f64 / 1_048_576.0
+            human_size(*size)
         ),
     }
 }
@@ -1360,8 +2044,17 @@ mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
 
-    fn w(s: &str) -> Vec<String> {
-        tokenize(s)
+    fn w(s: &str) -> Vec<Word> {
+        split_words(s, true)
+    }
+
+    fn texts(words: &[Word]) -> Vec<&str> {
+        words.iter().map(|w| w.text.as_str()).collect()
+    }
+
+    /// The argv forever-ago would be found with in a shell command line.
+    fn found(s: &str) -> Option<Vec<String>> {
+        find_invocation(&w(s), 0).map(|f| f.words.into_iter().map(|w| w.text).collect())
     }
 
     struct Fixture {
@@ -1392,6 +2085,12 @@ mod tests {
             path
         }
 
+        fn link(&self, target: impl AsRef<Path>, rel: &str) {
+            let path = self.root.join(rel);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            symlink(target, path).unwrap();
+        }
+
         fn sources(&self) -> Sources {
             Sources {
                 home: self.home.clone(),
@@ -1402,19 +2101,43 @@ mod tests {
                 pm2_dump: None,
                 proc_root: None,
                 passwd: self.write("etc/passwd", "root:x:0:0::/root:/bin/sh\nbob:x:1001:1001::/srv/bob:/bin/sh\n"),
+                user: "me".into(),
+                uid: "1000".into(),
+                runtime_dir: self.root.join("run/user/1000"),
+                host: "box.example.com".into(),
                 live: false,
             }
         }
+
+        fn jobs(&self) -> Vec<Job> {
+            discover(&self.sources()).0
+        }
+
+        fn job_with(&self, source: &str, extra: &[&str]) -> Job {
+            let mut argv = vec!["forever-ago", "--source", source, "--prefix", "p", "--once"];
+            argv.extend(extra);
+            test_job(&argv, &self.home, &self.home)
+        }
     }
 
+    // --- tokenizing and finding the command --------------------------------
+
     #[test]
-    fn tokenize_handles_quotes_and_escapes() {
+    fn split_words_handles_quotes_escapes_operators_and_comments() {
         assert_eq!(
-            w(r#"forever-ago --source "/a b/c" --prefix 'x y' --dest-dir /d\ e"#),
+            texts(&w(r#"forever-ago --source "/a b/c" --prefix 'x y' --dest-dir /d\ e"#)),
             vec!["forever-ago", "--source", "/a b/c", "--prefix", "x y", "--dest-dir", "/d e"]
         );
-        assert_eq!(w(r#"sh -c "echo \"hi\"""#), vec!["sh", "-c", "echo \"hi\""]);
-        assert_eq!(w("cd /x;forever-ago&&b||c 2>&1 'a;b'"), vec!["cd", "/x", ";", "forever-ago", "&&", "b", "||", "c", "2>&1", "a;b"]);
+        assert_eq!(
+            texts(&w("cd /x;forever-ago&&b||c 2>&1 'a;b' # trailing comment")),
+            vec!["cd", "/x", ";", "forever-ago", "&&", "b", "||", "c", "2>&1", "a;b"]
+        );
+        assert_eq!(texts(&w("(cd /x && y)")), vec!["(", "cd", "/x", "&&", "y", ")"]);
+        assert_eq!(texts(&w("--prefix v-$(hostname -s) `date`")), vec!["--prefix", "v-$(hostname -s)", "`date`"]);
+        // systemd values are not shell: `#` and parens are literal there.
+        assert_eq!(tokenize("a#b (c)"), vec!["a#b", "(c)"]);
+        let quoted = w(r#""$ARGS" $ARGS"#);
+        assert!(quoted[0].quoted && !quoted[1].quoted);
     }
 
     #[test]
@@ -1422,15 +2145,15 @@ mod tests {
         let mut e = Vec::new();
         parse_unit_text(
             "[Service]\n# c\nExecStart=/bin/forever-ago \\\n    --prefix v \\\n# ignored\n    --once\nUser=bob\n",
+            0,
             &mut e,
         );
-        assert_eq!(e[0], ("Service".into(), "ExecStart".into(), "/bin/forever-ago --prefix v --once".into()));
-        assert_eq!(e[1], ("Service".into(), "User".into(), "bob".into()));
+        assert_eq!((e[0].key.as_str(), e[0].value.as_str()), ("ExecStart", "/bin/forever-ago --prefix v --once"));
+        assert_eq!((e[1].key.as_str(), e[1].value.as_str()), ("User", "bob"));
     }
 
     #[test]
     fn finds_invocation_only_in_command_position() {
-        let found = |s: &str| find_invocation(&w(s), 0).map(|(_, argv)| argv);
         assert_eq!(found("forever-ago --prefix v --once").unwrap()[0], "forever-ago");
         assert_eq!(found("FOO=1 nice -n 10 /opt/forever-ago --prefix v").unwrap()[0], "/opt/forever-ago");
         assert_eq!(
@@ -1438,17 +2161,69 @@ mod tests {
             vec!["forever-ago", "--prefix", "v"]
         );
         assert_eq!(found("/bin/sh -lc 'cd /x; forever-ago --prefix v'").unwrap()[0], "forever-ago");
+        assert_eq!(found("if true; then forever-ago --prefix v; fi").unwrap()[0], "forever-ago");
         assert!(found("notify-send 'forever-ago failed'").is_none());
         assert!(found("restic backup /home/me/code/forever-ago/").is_none());
         assert!(found("env FOO=/x/forever-ago restic backup").is_none());
     }
 
+    /// Arguments of a wrapped command are not commands, even when they end in
+    /// /forever-ago; the command a wrapper runs is found by its real grammar.
     #[test]
-    fn cd_before_invocation_sets_cwd() {
-        let (cds, _) = find_invocation(&w("cd $HOME/vault && forever-ago --prefix v"), 0).unwrap();
-        let vars = HashMap::from([("HOME".to_string(), "/h".to_string())]);
-        assert_eq!(apply_cds(Path::new("/h"), cds.as_deref(), Path::new("/h"), &vars), PathBuf::from("/h/vault"));
+    fn wrappers_are_stepped_over_by_their_grammar() {
+        assert!(found("nice -n 19 restic backup ~/code/forever-ago").is_none());
+        assert!(found("timeout 1h rsync -a $HOME/code/forever-ago /mnt/usb").is_none());
+        assert!(found("flock /run/lock/forever-ago restic backup /x").is_none());
+        assert_eq!(
+            found("systemd-cat -t forever-ago /usr/bin/forever-ago --prefix v").unwrap(),
+            vec!["/usr/bin/forever-ago", "--prefix", "v"]
+        );
+        assert_eq!(found("sudo -u bob -- forever-ago --prefix v").unwrap()[0], "forever-ago");
+        assert_eq!(found("ionice -c 3 nice forever-ago --prefix v").unwrap()[0], "forever-ago");
+        assert_eq!(found("mise exec -- forever-ago --prefix v"), None, "mise is not a known wrapper");
     }
+
+    #[test]
+    fn shells_behind_wrappers_are_descended() {
+        let f = find_invocation(&w("flock -n /tmp/l sh -c 'cd /x && forever-ago --prefix v'"), 0).unwrap();
+        assert_eq!(f.cds, vec!["/x"]);
+        assert_eq!(found("timeout 1h bash -c \"forever-ago --prefix v\"").unwrap()[0], "forever-ago");
+        assert_eq!(found("flock /tmp/l -c 'forever-ago --prefix v'").unwrap()[0], "forever-ago");
+        let f = find_invocation(&w("env -C /data forever-ago --prefix v"), 0).unwrap();
+        assert_eq!(f.cds, vec!["/data"]);
+        let f = find_invocation(&w("( cd /x && forever-ago --prefix v )"), 0).unwrap();
+        assert_eq!(f.cds, vec!["/x"]);
+    }
+
+    /// Classifying a word must never look at the jobs process's own cwd: a
+    /// `forever-ago/` checkout next to you does not make `forever-ago` a directory.
+    #[test]
+    fn bare_name_is_a_command_wherever_jobs_runs() {
+        let fx = Fixture::new();
+        fx.mkdir("home/me/forever-ago"); // the repo checkout, say
+        let words = w("forever-ago --source vault --prefix v --once");
+        // Same answer no matter what exists on disk.
+        assert!(find_invocation(&words, 0).is_some());
+    }
+
+    #[test]
+    fn expansion_splits_bare_vars_and_resolves_hostname() {
+        let vars = HashMap::from([("ARGS".to_string(), "--source /x --prefix v".to_string()), ("HOME".to_string(), "/h".to_string())]);
+        let mut notes = Vec::new();
+        let argv = expand_words(&w("forever-ago $ARGS --dest-dir ${HOME}/b"), &vars, true, &mut notes);
+        assert_eq!(argv, vec!["forever-ago", "--source", "/x", "--prefix", "v", "--dest-dir", "/h/b"]);
+        // systemd keeps `${VAR}` as one word; quotes always do.
+        let argv = expand_words(&split_words("forever-ago ${ARGS} \"$ARGS\"", false), &vars, false, &mut notes);
+        assert_eq!(argv, vec!["forever-ago", "--source /x --prefix v", "--source /x --prefix v"]);
+        assert!(notes.is_empty(), "{notes:?}");
+
+        let argv = expand_words(&w("--prefix v-$(hostname) --at $(date +%H:00) $UNSET"), &vars, true, &mut notes);
+        assert_eq!(argv[1], format!("v-{}", hostname()));
+        assert!(notes.iter().any(|n| n.contains("command substitution")), "{notes:?}");
+        assert!(notes.iter().any(|n| n.contains("only set at run time")), "{notes:?}");
+    }
+
+    // --- systemd -------------------------------------------------------------
 
     #[test]
     fn systemd_service_with_timer_is_discovered() {
@@ -1459,17 +2234,12 @@ mod tests {
             "[Service]\nType=oneshot\nEnvironment=\"DEST=%h/backups/v\"\n\
              ExecStart=-/opt/bin/forever-ago \\\n  --source %h/vault \\\n  --dest-dir ${DEST} --prefix vault \\\n  --keep-daily 7 --once\n",
         );
-        fx.write(
-            "user-units/fa-vault.timer",
-            "[Timer]\nOnCalendar=*-*-* 03:00:00\nPersistent=true\nRandomizedDelaySec=15m\n",
-        );
-        fx.mkdir("user-units/timers.target.wants");
-        symlink(fx.root.join("user-units/fa-vault.timer"), fx.root.join("user-units/timers.target.wants/fa-vault.timer")).unwrap();
+        fx.write("user-units/fa-vault.timer", "[Timer]\nOnCalendar=*-*-* 03:00:00\nPersistent=true\nRandomizedDelaySec=15m\n");
+        fx.link(fx.root.join("user-units/fa-vault.timer"), "user-units/timers.target.wants/fa-vault.timer");
         // Mentions forever-ago, but does not run it.
         fx.write("user-units/fa-alert.service", "[Service]\nExecStart=/usr/bin/notify-send \"forever-ago failed\"\n");
 
-        let (jobs, warnings) = discover(&fx.sources());
-        assert!(warnings.is_empty());
+        let jobs = fx.jobs();
         assert_eq!(jobs.len(), 1, "{jobs:#?}");
         let job = &jobs[0];
         assert_eq!(job.inv.name, "fa-vault.service");
@@ -1482,7 +2252,78 @@ mod tests {
     }
 
     #[test]
-    fn earlier_unit_dir_wins_and_dropins_can_reset_execstart() {
+    fn template_instances_are_discovered() {
+        let fx = Fixture::new();
+        let vault = fx.mkdir("home/me/vault");
+        fx.write("user-units/fa@.service", "[Service]\nExecStart=/opt/forever-ago --source %h/%i --prefix %i --once\n");
+        fx.write("user-units/fa@.timer", "[Timer]\nOnCalendar=daily\n");
+        fx.link("../fa@.timer", "user-units/timers.target.wants/fa@vault.timer");
+        let jobs = fx.jobs();
+        assert_eq!(jobs.len(), 1, "{jobs:#?}");
+        assert_eq!(jobs[0].inv.name, "fa@vault.service");
+        assert_eq!(jobs[0].source, vault);
+        assert_eq!(jobs[0].prefix.as_deref(), Some("vault"));
+        assert_eq!(jobs[0].inv.triggers, vec!["OnCalendar=daily"]);
+        assert_eq!(jobs[0].inv.enabled, Some(true));
+    }
+
+    #[test]
+    fn manager_env_and_environment_files_feed_expansion() {
+        let fx = Fixture::new();
+        let vault = fx.mkdir("home/me/vault");
+        fx.write("home/me/.fa.env", "# settings\nPREFIX=\"vault\"\nARGS=--keep-daily 3 --once\n");
+        fx.write(
+            "user-units/fa.service",
+            "[Service]\nEnvironmentFile=-%h/.fa.env\nEnvironmentFile=-%h/missing.env\n\
+             ExecStart=forever-ago --source ${HOME}/vault --prefix ${PREFIX} $ARGS\n",
+        );
+        let jobs = fx.jobs();
+        assert_eq!(jobs[0].source, vault);
+        assert_eq!(jobs[0].prefix.as_deref(), Some("vault"));
+        assert!(jobs[0].once);
+        assert!(matches!(jobs[0].retention, Some(RetentionPolicy::Gfs { daily: 3, .. })));
+    }
+
+    /// systemd documents %h as the *manager's* home, which for the system
+    /// manager is /root even with User=; `~` and $HOME follow User=.
+    #[test]
+    fn system_units_resolve_specifiers_and_user_homes_separately() {
+        let fx = Fixture::new();
+        fx.write(
+            "system-units/fa.service",
+            "[Service]\nUser=bob\nWorkingDirectory=~\nExecStart=/usr/bin/forever-ago --source %h/data --dest-dir ~/b --prefix d-%l\n",
+        );
+        let jobs = fx.jobs();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].inv.scheduler, Scheduler::SystemdSystem);
+        assert_eq!(jobs[0].source, PathBuf::from("/root/data"));
+        assert_eq!(jobs[0].dest_dir, PathBuf::from("/srv/bob/b"));
+        assert_eq!(jobs[0].prefix.as_deref(), Some("d-box"));
+        assert!(!jobs[0].once, "no --once means forever-ago's own daemon loop");
+    }
+
+    #[test]
+    fn specifiers() {
+        let m = ManagerInfo {
+            user_scope: true,
+            home: "/h".into(),
+            user: "me".into(),
+            uid: "1000".into(),
+            runtime_dir: "/run/user/1000".into(),
+            host: "box.lan".into(),
+        };
+        let (s, unknown) = expand_specifiers("%n %N %p %i %I %j %f %h %u %U %H %l %t %S %C %L %E %T %V %% %Y", "fa-x@a-b.service", &m);
+        assert_eq!(
+            s,
+            "fa-x@a-b.service fa-x@a-b fa-x a-b a/b x /a/b /h me 1000 box.lan box /run/user/1000 \
+             /h/.local/state /h/.cache /h/.local/state/log /h/.config /tmp /var/tmp % %Y"
+        );
+        assert_eq!(unknown, vec!['Y']);
+        assert_eq!(unescape_unit(r"home-me-My\x20Notes"), "home/me/My Notes");
+    }
+
+    #[test]
+    fn dropins_apply_in_systemd_order_and_reset_execstart() {
         let fx = Fixture::new();
         fx.mkdir("home/me/vault");
         // The vendor copy is shadowed by the user's own file of the same name.
@@ -1491,30 +2332,69 @@ mod tests {
         // b runs forever-ago in its main file, but a drop-in replaces the command.
         fx.write("user-units/b.service", "[Service]\nExecStart=forever-ago --source vault --prefix b --once\n");
         fx.write("user-units/b.service.d/override.conf", "[Service]\nExecStart=\nExecStart=/bin/true\n");
-        // c is masked.
-        fx.mkdir("user-units");
-        symlink("/dev/null", fx.root.join("user-units/c.service")).unwrap();
+        // fa-c is switched off by a prefix drop-in for every fa-* unit.
+        fx.write("user-units/fa-c.service", "[Service]\nExecStart=forever-ago --source vault --prefix c --once\n");
+        fx.write("user-units/fa-.service.d/off.conf", "[Service]\nExecStart=\nExecStart=/bin/true\n");
+        // d gets its forever-ago command from a drop-in.
+        fx.write("user-units/d.service", "[Service]\nExecStart=/bin/true\n");
+        let dropin = fx.write("user-units/d.service.d/10-run.conf", "[Service]\nExecStart=\nExecStart=forever-ago --source vault --prefix d --once\n");
+        // e is masked.
+        fx.link("/dev/null", "user-units/e.service");
 
-        let (jobs, _) = discover(&fx.sources());
+        let jobs = fx.jobs();
         let names: Vec<&str> = jobs.iter().map(|j| j.inv.name.as_str()).collect();
-        assert_eq!(names, vec!["a.service"]);
-        assert_eq!(jobs[0].inv.enabled, Some(false), "no timer and not wanted by any target");
+        assert_eq!(names, vec!["a.service", "d.service"]);
+        assert_eq!(jobs[0].inv.enabled, Some(false), "no trigger and not wanted by any target");
+        assert!(jobs[1].inv.defined_in.ends_with(&format!("(ExecStart from {})", dropin.display())), "{}", jobs[1].inv.defined_in);
     }
 
     #[test]
-    fn system_unit_resolves_home_from_user_field() {
+    fn aliases_are_listed_once() {
         let fx = Fixture::new();
-        fx.write(
-            "system-units/fa.service",
-            "[Service]\nUser=bob\nWorkingDirectory=~\nExecStart=/usr/bin/forever-ago --source ~/data --prefix d\n",
-        );
-        let (jobs, _) = discover(&fx.sources());
-        assert_eq!(jobs.len(), 1);
-        assert_eq!(jobs[0].inv.scheduler, Scheduler::SystemdSystem);
-        assert_eq!(jobs[0].source, PathBuf::from("/srv/bob/data"));
-        assert_eq!(jobs[0].dest_dir, PathBuf::from("/srv/bob/backups"));
-        assert!(!jobs[0].once, "no --once means forever-ago's own daemon loop");
+        fx.mkdir("home/me/vault");
+        fx.write("user-units/fa.service", "[Service]\nExecStart=forever-ago --source vault --prefix v --once\n");
+        fx.link("fa.service", "user-units/vault-backup.service");
+        // A linked unit kept elsewhere under its own name is not an alias.
+        fx.write("elsewhere/fb.service", "[Service]\nExecStart=forever-ago --source vault --prefix w --once\n");
+        fx.link(fx.root.join("elsewhere/fb.service"), "user-units/fb.service");
+        let names: Vec<String> = fx.jobs().into_iter().map(|j| j.inv.name).collect();
+        assert_eq!(names, vec!["fa.service", "fb.service"]);
     }
+
+    #[test]
+    fn units_started_by_paths_or_targets_are_scheduled() {
+        let fx = Fixture::new();
+        fx.mkdir("home/me/vault");
+        fx.write("user-units/fa-boot.service", "[Service]\nExecStart=forever-ago --source vault --prefix b --once\n");
+        fx.link("../fa-boot.service", "user-units/default.target.wants/fa-boot.service");
+        fx.write("user-units/fa-watch.service", "[Service]\nExecStart=forever-ago --source vault --prefix w --once\n");
+        fx.write("user-units/fa-watch.path", "[Path]\nPathChanged=%h/vault/.trigger\n");
+        fx.link("../fa-watch.path", "user-units/paths.target.wants/fa-watch.path");
+        let jobs = fx.jobs();
+        let boot = jobs.iter().find(|j| j.inv.name == "fa-boot.service").unwrap();
+        assert_eq!(boot.inv.triggers, vec!["whenever default.target starts"]);
+        assert_eq!(boot.inv.enabled, Some(true));
+        let watch = jobs.iter().find(|j| j.inv.name == "fa-watch.service").unwrap();
+        assert_eq!(watch.inv.triggers, vec!["PathChanged=%h/vault/.trigger"]);
+        assert_eq!(watch.inv.enabled, Some(true));
+    }
+
+    #[test]
+    fn live_state_overrides_offline_guess() {
+        let mut inv = Invocation::new(Scheduler::SystemdUser, "x.service".into(), "x".into(), vec![], "/".into(), "/".into());
+        inv.units = vec!["x.service".into(), "x.timer".into()];
+        inv.enabled = Some(true);
+        let live = parse_systemctl_show(
+            "Result=success\nId=x.service\nActiveState=inactive\nUnitFileState=static\n\n\
+             NextElapseUSecRealtime=\nLastTriggerUSec=Thu 2026-10-01 03:06:22 EDT\nId=x.timer\nActiveState=inactive\nUnitFileState=disabled\n",
+        );
+        apply_unit_state(&mut inv, &live);
+        assert_eq!(inv.enabled, Some(false), "an inactive timer will not fire");
+        assert!(inv.state.iter().any(|(k, v)| k == "last run" && v.contains("(success)")), "{:?}", inv.state);
+        assert!(!inv.state.iter().any(|(k, _)| k == "next run"));
+    }
+
+    // --- cron, pm2, processes ---------------------------------------------------
 
     #[test]
     fn crontab_lines_become_jobs() {
@@ -1522,7 +2402,7 @@ mod tests {
         let vault = fx.mkdir("home/me/vault");
         let mut src = fx.sources();
         src.crontab = Some(
-            "MAILTO=\"\"\n# nightly\n15 3 * * * cd $HOME/vault && forever-ago --prefix v --retain 3 --once >> ~/fa.log 2>&1\n\
+            "MAILTO=\"\"\n# nightly\n15 3 * * * cd $HOME/vault && forever-ago --prefix v-$(hostname -s) --retain 3 --once >> ~/fa.log 2>&1 # keep\n\
              @daily echo forever-ago is great\n"
                 .into(),
         );
@@ -1534,9 +2414,30 @@ mod tests {
         assert_eq!(user_job.source, vault);
         assert_eq!(user_job.inv.triggers, vec!["15 3 * * *"]);
         assert_eq!(user_job.retention, Some(RetentionPolicy::Count(3)));
+        assert_eq!(user_job.prefix, Some(format!("v-{}", hostname().split('.').next().unwrap())));
         let sys_job = jobs.iter().find(|j| j.inv.name.contains("cron.d")).unwrap();
         assert_eq!(sys_job.inv.triggers, vec!["0 4 * * 0"]);
         assert_eq!(sys_job.inv.home, PathBuf::from("/srv/bob"));
+    }
+
+    #[test]
+    fn crontab_home_override_moves_cwd_and_tilde() {
+        let fx = Fixture::new();
+        let data = fx.mkdir("data");
+        let mut src = fx.sources();
+        src.crontab = Some(format!("HOME={}\n0 3 * * * forever-ago --source . --dest-dir ~/b --prefix v --once\n", data.display()));
+        let (jobs, _) = discover(&src);
+        assert_eq!(jobs[0].source, data);
+        assert_eq!(jobs[0].dest_dir, data.join("b"));
+    }
+
+    #[test]
+    fn cron_skips_files_cron_itself_ignores() {
+        assert!(cron_reads("forever-ago"));
+        assert!(cron_reads("fa_nightly-2"));
+        assert!(!cron_reads("forever-ago.disabled"));
+        assert!(!cron_reads("fa.dpkg-old"));
+        assert!(!cron_reads("fa~"));
     }
 
     #[test]
@@ -1546,14 +2447,18 @@ mod tests {
             {"name":"n8n","pm_exec_path":"/usr/bin/n8n","args":["start"]},
             {"name":"vault-backup","pm_exec_path":"/h/.cargo/bin/forever-ago","pm_cwd":"/h/.openclaw",
              "args":["--source",".","--prefix","oc","--run-now"],"status":"online"},
-            {"name":"old","script":"forever-ago","args":"--source /x --prefix old","status":"stopped"}
+            {"name":"old","script":"forever-ago","args":"--source /x --prefix old","status":"stopped"},
+            {"name":"cron","script":"forever-ago","args":"--source /y --prefix y --once","status":"stopped","cron_restart":"0 3 * * *"}
         ]"#;
         let invs = parse_pm2_dump(dump, "dump.pm2", home).unwrap();
-        assert_eq!(invs.len(), 2);
+        assert_eq!(invs.len(), 3);
         assert_eq!(invs[0].cwd, PathBuf::from("/h/.openclaw"));
         assert_eq!(invs[0].enabled, Some(true));
         assert_eq!(invs[1].argv, vec!["forever-ago", "--source", "/x", "--prefix", "old"]);
         assert_eq!(invs[1].enabled, Some(false));
+        // pm2 fires cron_restart even for a stopped app.
+        assert_eq!(invs[2].enabled, Some(true));
+        assert_eq!(invs[2].triggers, vec!["cron_restart 0 3 * * *"]);
     }
 
     #[test]
@@ -1563,7 +2468,12 @@ mod tests {
         let other = fx.mkdir("home/me/other");
         fx.write("user-units/fa.service", "[Service]\nExecStart=forever-ago --source vault --prefix v\n");
         let proc_root = fx.mkdir("proc");
-        for (pid, args) in [("4242", "forever-ago\0--source\0vault\0--prefix\0v\0"), ("777", "forever-ago\0--prefix\0o\0")] {
+        for (pid, args) in [
+            ("4242", "forever-ago\0--source\0vault\0--prefix\0v\0"),
+            ("777", "forever-ago\0--prefix\0o\0"),
+            // Someone else's daemon: cwd unreadable, source relative. Not a job we can place.
+            ("13", "forever-ago\0--source\0.\0--prefix\0r\0"),
+        ] {
             fx.write(&format!("proc/{pid}/cmdline"), args);
             fx.write(&format!("proc/{pid}/status"), "Name:\tforever-ago\nUid:\t1000\t1000\t1000\t1000\n");
         }
@@ -1581,37 +2491,64 @@ mod tests {
         assert_eq!(lone.inv.scheduler, Scheduler::Daemon);
     }
 
+    // --- interpreting arguments ----------------------------------------------------
+
     #[test]
-    fn unparseable_arguments_still_match_by_source() {
+    fn unparseable_arguments_keep_what_they_can() {
         let fx = Fixture::new();
         let vault = fx.mkdir("home/me/vault");
-        fx.write("user-units/fa.service", "[Service]\nExecStart=forever-ago --source=vault --prefix v --from-the-future\n");
-        let (jobs, _) = discover(&fx.sources());
+        fx.write(
+            "user-units/fa.service",
+            "[Service]\nExecStart=forever-ago --source=vault --prefix v --exclude node_modules --exclude=*.log --from-the-future\n",
+        );
+        let jobs = fx.jobs();
         assert_eq!(jobs[0].source, vault);
         assert!(jobs[0].problems[0].contains("cannot parse"), "{:?}", jobs[0].problems);
+        let raw: Vec<&str> = jobs[0].excludes.iter().map(|(r, _)| r.as_str()).collect();
+        assert_eq!(raw, vec!["node_modules", "*.log"]);
+        // The caveat comes first, above the details it qualifies.
+        let out = render_job(&jobs[0], &fx.home);
+        assert!(out.lines().nth(1).unwrap().contains("problem    this build"), "{out}");
     }
 
-    fn job_for(fx: &Fixture, source: &str, excludes: &[&str]) -> Job {
-        let mut argv = vec!["forever-ago".to_string(), "--source".into(), source.into(), "--prefix".into(), "p".into(), "--once".into()];
-        for e in excludes {
-            argv.push("--exclude".into());
-            argv.push(e.to_string());
-        }
-        let inv = Invocation::new(Scheduler::Cron, source.into(), "test".into(), argv, fx.home.clone(), fx.home.clone());
-        resolve(inv).unwrap()
+    #[test]
+    fn help_version_and_other_subcommands_are_not_jobs() {
+        let fx = Fixture::new();
+        fx.write("user-units/a.service", "[Service]\nExecStart=forever-ago --version\n");
+        fx.write("user-units/b.service", "[Service]\nExecStart=forever-ago --help\n");
+        fx.write("user-units/c.service", "[Service]\nExecStart=forever-ago prune --dry-run\n");
+        fx.write("user-units/d.service", "[Service]\nExecStart=forever-ago jobs --all\n");
+        assert!(fx.jobs().is_empty());
     }
+
+    #[test]
+    fn unreadable_exclude_file_is_not_called_fatal() {
+        let fx = Fixture::new();
+        fx.mkdir("home/me/vault");
+        let ex = fx.write("home/me/ex", ".venv\n");
+        fs::set_permissions(&ex, std::os::unix::fs::PermissionsExt::from_mode(0o000)).unwrap();
+        let job = fx.job_with("vault", &["--exclude-from", ex.to_str().unwrap()]);
+        fs::set_permissions(&ex, std::os::unix::fs::PermissionsExt::from_mode(0o644)).unwrap();
+        if fs::read(&ex).is_ok() && job.problems.is_empty() {
+            return; // running as root: nothing is unreadable
+        }
+        assert!(job.problems[0].contains("cannot read --exclude-from"), "{:?}", job.problems);
+        assert!(!job.problems[0].contains("will fail"), "{:?}", job.problems);
+    }
+
+    // --- resolution and output ---------------------------------------------------
 
     #[test]
     fn resolution_climbs_to_the_nearest_ancestor_with_jobs() {
         let fx = Fixture::new();
         let deep = fx.mkdir("home/me/code/vault/Notes/2026");
-        let jobs = vec![job_for(&fx, "code/vault", &[]), job_for(&fx, "code", &[]), job_for(&fx, "code", &[])];
+        let jobs = vec![fx.job_with("code/vault", &[]), fx.job_with("code", &[]), fx.job_with("code", &[])];
 
-        let (dir, hits) = covering(&jobs, &deep, &fx.home).unwrap();
+        let (dir, hits) = covering(&jobs, &deep, &fx.home).found.unwrap();
         assert_eq!(dir, fx.home.join("code/vault"));
         assert_eq!(hits.len(), 1);
 
-        let (dir, hits) = covering(&jobs, &fx.home.join("code/elsewhere"), &fx.home).unwrap();
+        let (dir, hits) = covering(&jobs, &fx.home.join("code/elsewhere"), &fx.home).found.unwrap();
         assert_eq!(dir, fx.home.join("code"));
         assert_eq!(hits.len(), 2);
     }
@@ -1621,8 +2558,8 @@ mod tests {
         let fx = Fixture::new();
         let cwd = fx.mkdir("home/me/projects/x");
         // A job on the parent of $HOME must not be reported for a directory inside it.
-        let jobs = vec![job_for(&fx, fx.root.join("home").to_str().unwrap(), &[])];
-        assert!(covering(&jobs, &cwd, &fx.home).is_none());
+        let jobs = vec![fx.job_with(fx.root.join("home").to_str().unwrap(), &[])];
+        assert!(covering(&jobs, &cwd, &fx.home).found.is_none());
 
         let report = report(&jobs, &cwd, &fx.home, false);
         assert!(report.contains("no scheduled forever-ago jobs cover ~/projects/x"), "{report}");
@@ -1630,15 +2567,32 @@ mod tests {
         assert!(report.contains("1 job(s) back up other directories"), "{report}");
     }
 
+    /// A job whose excludes leave the cwd out does not back it up, so the
+    /// climb goes on to the job that does, and says why it skipped the first.
     #[test]
-    fn report_explains_ancestor_resolution_and_exclusions() {
+    fn resolution_skips_jobs_that_exclude_the_cwd() {
         let fx = Fixture::new();
         let cwd = fx.mkdir("home/me/vault/proj/node_modules/pkg");
-        let jobs = vec![job_for(&fx, "vault", &["node_modules"])];
+        let jobs = vec![fx.job_with("vault", &["--exclude", "node_modules"]), fx.job_with(".", &[])];
         let report = report(&jobs, &cwd, &fx.home, false);
-        assert!(report.contains("no jobs back up ~/vault/proj/node_modules/pkg itself; nearest ancestor with jobs: ~/vault"), "{report}");
-        assert!(report.contains("~/vault  (1 job)"), "{report}");
-        assert!(report.contains("excluded by `node_modules`"), "{report}");
+        assert!(report.starts_with("no jobs back up ~/vault/proj/node_modules/pkg itself; nearest ancestor with jobs: ~\n"), "{report}");
+        assert!(report.contains("test-job (cron) backs up ~/vault but excludes ~/vault/proj/node_modules/pkg (`node_modules`)"), "{report}");
+        assert!(report.contains("\n~  (1 job)"), "{report}");
+
+        // Nothing else covers it: still say who skipped it.
+        let only = vec![fx.job_with("vault", &["--exclude", "node_modules"])];
+        let report = super::report(&only, &cwd, &fx.home, false);
+        assert!(report.contains("no scheduled forever-ago jobs cover"), "{report}");
+        assert!(report.contains("but excludes"), "{report}");
+    }
+
+    #[test]
+    fn report_renders_a_job() {
+        let fx = Fixture::new();
+        let cwd = fx.mkdir("home/me/vault");
+        let jobs = vec![fx.job_with("vault", &[])];
+        let report = report(&jobs, &cwd, &fx.home, false);
+        assert!(report.starts_with("~/vault  (1 job)\n"), "{report}");
         assert!(report.contains("NONE: a one-shot"), "{report}");
         assert!(report.contains("~/backups/p-YYYY-MM-DD.tar.gz"), "{report}");
     }
@@ -1648,23 +2602,32 @@ mod tests {
         let fx = Fixture::new();
         fx.mkdir("home/me/a");
         fx.mkdir("home/me/b");
-        let jobs = vec![job_for(&fx, "a", &[]), job_for(&fx, "b", &[])];
+        let jobs = vec![fx.job_with("a", &[]), fx.job_with("b", &[])];
         let report = report(&jobs, Path::new("/"), &fx.home, true);
         assert!(report.find("~/a  (1 job)").unwrap() < report.find("~/b  (1 job)").unwrap(), "{report}");
     }
 
     #[test]
-    fn live_state_overrides_offline_guess() {
-        let mut inv = Invocation::new(Scheduler::SystemdUser, "x.service".into(), "x".into(), vec![], "/".into(), "/".into());
-        inv.units = vec!["x.service".into(), "x.timer".into()];
-        inv.enabled = Some(true);
-        let live = parse_systemctl_show(
-            "Result=success\nId=x.service\nActiveState=inactive\nUnitFileState=static\n\n\
-             NextElapseUSecRealtime=\nLastTriggerUSec=Thu 2026-10-01 03:06:22 EDT\nId=x.timer\nActiveState=inactive\nUnitFileState=disabled\n",
-        );
-        apply_unit_state(&mut inv, &live);
-        assert_eq!(inv.enabled, Some(false), "an inactive timer will not fire");
-        assert!(inv.state.iter().any(|(k, v)| k == "last run" && v.contains("(success)")), "{:?}", inv.state);
-        assert!(!inv.state.iter().any(|(k, _)| k == "next run"));
+    fn running_daemon_does_not_contradict_a_stopped_scheduler() {
+        let fx = Fixture::new();
+        fx.mkdir("home/me/vault");
+        let mut job = test_job(&["forever-ago", "--source", "vault", "--prefix", "p"], &fx.home, &fx.home);
+        job.inv.scheduler = Scheduler::Pm2;
+        job.inv.enabled = Some(false);
+        job.pids = vec![42];
+        let out = render_job(&job, &fx.home);
+        assert!(!out.contains("WARNING"), "{out}");
+        assert!(out.contains("the running daemon still backs up daily at 03:00"), "{out}");
+    }
+
+    #[test]
+    fn tilde_survives_a_symlinked_home() {
+        let fx = Fixture::new();
+        let real = fx.mkdir("data/me");
+        fx.link(&real, "home/link");
+        let link = fx.root.join("home/link");
+        assert_eq!(tilde(&real.join("vault"), &link), "~/vault");
+        assert_eq!(tilde(&link.join("vault"), &link), "~/vault");
+        assert_eq!(tilde(Path::new("/elsewhere"), &link), "/elsewhere");
     }
 }

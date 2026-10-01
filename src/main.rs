@@ -91,13 +91,16 @@ struct Cli {
     ///
     /// Matched against each entry's path RELATIVE to the source root:
     ///   name      any path component named exactly `name` (e.g. `.venv`, `node_modules`)
+    ///   ./name    `name` at the source root only
     ///   *.ext     files with that extension, case-insensitive (e.g. `*.pyc`)
+    ///   *.ext/    directories with that extension (e.g. `*.egg-info/`)
     ///   na*e?     any path component matching the wildcards: `*` any run, `?` one char
     ///             (e.g. `*.sync-conflict-*`)
     ///   a/b/c     that subtree of the source root
     /// An excluded directory is pruned whole; its children are never walked.
     /// A pattern that could never match (wildcards inside a/b/c, a leading `/`,
-    /// an empty line) is rejected at startup instead of silently doing nothing.
+    /// an empty line, a lone `*`) is rejected at startup instead of silently
+    /// doing nothing.
     #[arg(long = "exclude", value_name = "PATTERN", verbatim_doc_comment)]
     excludes: Vec<String>,
 
@@ -297,6 +300,24 @@ fn read_exclude_file(path: &Path) -> Result<Vec<String>> {
         .collect())
 }
 
+/// "1.23GB" from a gigabyte up, "985M" / "12K" / "512B" below it (1024-based).
+pub(crate) fn human_size(bytes: u64) -> String {
+    const K: f64 = 1024.0;
+    let b = bytes as f64;
+    if b >= K * K * K * K {
+        format!("{:.2}TB", b / (K * K * K * K))
+    } else if b >= K * K * K {
+        format!("{:.2}GB", b / (K * K * K))
+    } else if b >= K * K {
+        format!("{:.0}M", b / (K * K))
+    } else if b >= K {
+        format!("{:.0}K", b / K)
+    } else {
+        format!("{bytes}B")
+    }
+}
+
+
 fn log(level: &str, msg: impl AsRef<str>) {
     eprintln!("{} [{level}] {}", Local::now().to_rfc3339(), msg.as_ref());
 }
@@ -493,7 +514,7 @@ fn remove_stale_temp_files(cfg: &Config) -> Result<()> {
     {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().to_string();
-        let Some((archive, pid)) = name.split_once(".tmp-") else { continue };
+        let Some((archive, pid)) = name.rsplit_once(".tmp-") else { continue };
         let ours = parse_backup_date(&cfg.prefix, archive).is_some()
             && !pid.is_empty()
             && pid.chars().all(|c| c.is_ascii_digit());
@@ -516,6 +537,8 @@ enum ExcludePattern {
     Component(String),
     /// `*.pyc` — any file (not directory) with this extension.
     Extension(String),
+    /// `*.egg-info/` — any directory with this extension.
+    DirExtension(String),
     /// `*.sync-conflict-*` — any path component matching `*` / `?` wildcards.
     Glob(String),
     /// `a/b/c` — this relative subtree.
@@ -527,20 +550,24 @@ impl ExcludePattern {
     /// run loudly, not quietly archive what it was meant to drop.
     fn parse(raw: &str) -> Result<Self> {
         let pat = raw.trim();
-        let pat = pat.strip_prefix("./").unwrap_or(pat).trim_end_matches('/');
         let wild = |s: &str| s.contains(['*', '?']);
+        if pat.starts_with('/') {
+            bail!(
+                "invalid exclude pattern {raw:?}: patterns are relative to the source root; \
+                 write `./name` to match only at the root, or `name` to match at any depth"
+            );
+        }
+        // `./name` anchors at the source root, like gitignore's `/name`.
+        let anchored = pat.starts_with("./");
+        let dir_only = pat.ends_with('/');
+        let pat = pat.strip_prefix("./").unwrap_or(pat).trim_end_matches('/');
         if pat.is_empty() || pat == "." || pat == ".." {
             bail!("invalid exclude pattern {raw:?}: it names no path");
         }
-        if pat.starts_with('/') {
-            bail!(
-                "invalid exclude pattern {raw:?}: patterns are relative to the source root, drop the leading `/`"
-            );
-        }
-        if pat.contains('/') {
+        if pat.contains('/') || anchored {
             if wild(pat) {
                 bail!(
-                    "invalid exclude pattern {raw:?}: wildcards only work in single-name patterns, not in a/b/c paths"
+                    "invalid exclude pattern {raw:?}: wildcards only work in single-name patterns, not in ./name or a/b/c paths"
                 );
             }
             if pat.split('/').any(|seg| seg.is_empty() || seg == "." || seg == "..") {
@@ -548,14 +575,16 @@ impl ExcludePattern {
             }
             return Ok(ExcludePattern::Prefix(PathBuf::from(pat)));
         }
-        if pat.chars().all(|c| c == '*' || c == '?') {
+        // `*`, `**`, `*?`: every name. A lone `?` only matches one-character names.
+        if pat.contains('*') && pat.chars().all(|c| c == '*' || c == '?') && pat.matches('?').count() <= 1 {
             bail!("invalid exclude pattern {raw:?}: it would exclude everything");
         }
         if let Some(ext) = pat.strip_prefix("*.")
             && !wild(ext)
             && !ext.contains('.')
         {
-            return Ok(ExcludePattern::Extension(ext.to_ascii_lowercase()));
+            let ext = ext.to_ascii_lowercase();
+            return Ok(if dir_only { ExcludePattern::DirExtension(ext) } else { ExcludePattern::Extension(ext) });
         }
         if wild(pat) {
             return Ok(ExcludePattern::Glob(pat.to_string()));
@@ -568,18 +597,18 @@ impl ExcludePattern {
         match self {
             ExcludePattern::Component(name) => rel.components().any(|c| c.as_os_str() == name.as_str()),
             // Files only: a notes folder called `Research.db` is not a database.
-            ExcludePattern::Extension(ext) => {
-                !is_dir
-                    && rel
-                        .extension()
-                        .is_some_and(|e| e.to_string_lossy().eq_ignore_ascii_case(ext))
-            }
+            ExcludePattern::Extension(ext) => !is_dir && has_extension(rel, ext),
+            ExcludePattern::DirExtension(ext) => is_dir && has_extension(rel, ext),
             ExcludePattern::Glob(pattern) => rel
                 .components()
                 .any(|c| wildcard_match(pattern, &c.as_os_str().to_string_lossy())),
             ExcludePattern::Prefix(prefix) => rel.starts_with(prefix),
         }
     }
+}
+
+fn has_extension(rel: &Path, ext: &str) -> bool {
+    rel.extension().is_some_and(|e| e.to_string_lossy().eq_ignore_ascii_case(ext))
 }
 
 /// `*` matches any run of characters (including none), `?` exactly one.
@@ -590,12 +619,13 @@ fn wildcard_match(pattern: &str, name: &str) -> bool {
     // Where the last `*` was, and how much of the name it has swallowed so far.
     let mut star: Option<(usize, usize)> = None;
     while ni < n.len() {
-        if pi < p.len() && (p[pi] == '?' || p[pi] == n[ni]) {
-            pi += 1;
-            ni += 1;
-        } else if pi < p.len() && p[pi] == '*' {
+        // `*` first: a name may itself contain a literal `*`.
+        if pi < p.len() && p[pi] == '*' {
             star = Some((pi, ni));
             pi += 1;
+        } else if pi < p.len() && (p[pi] == '?' || p[pi] == n[ni]) {
+            pi += 1;
+            ni += 1;
         } else if let Some((sp, sn)) = star {
             pi = sp + 1;
             ni = sn + 1;
@@ -661,6 +691,22 @@ fn append_filtered<W: Write>(
             stats.excluded += 1;
             continue;
         }
+        if ft.is_dir() {
+            for p in excludes {
+                if let ExcludePattern::Extension(ext) = p
+                    && has_extension(&rel, ext)
+                    && stats.dir_extension_warned.insert(ext.clone())
+                {
+                    log(
+                        "WARN",
+                        format!(
+                            "`*.{ext}` excludes files only, so directory {} is kept; write `*.{ext}/` to exclude such directories",
+                            rel.display()
+                        ),
+                    );
+                }
+            }
+        }
 
         let name_in_tar = Path::new(root_name).join(&rel);
 
@@ -708,8 +754,13 @@ fn append_filtered<W: Write>(
             let body = (&mut f).take(len).chain(std::io::repeat(0)).take(len);
             tar.append_data(&mut header, &name_in_tar, body)
                 .with_context(|| format!("failed to archive file {}", path.display()))?;
-            let after = f.metadata().ok();
-            if after.map(|m| (m.len(), m.modified().ok())) != Some((len, before.modified().ok())) {
+            // Size, mtime and ctime to the nanosecond. A write through a
+            // shared mmap can still slip past all three.
+            let stamp = |m: &fs::Metadata| {
+                use std::os::unix::fs::MetadataExt;
+                (m.len(), m.mtime(), m.mtime_nsec(), m.ctime(), m.ctime_nsec())
+            };
+            if f.metadata().ok().map(|m| stamp(&m)) != Some(stamp(&before)) {
                 log(
                     "WARN",
                     format!("changed while being archived, this copy may be inconsistent: {}", path.display()),
@@ -736,15 +787,17 @@ struct ArchiveStats {
     special: u64,
     vanished: u64,
     changed: u64,
+    /// `*.ext` patterns already warned about matching a directory.
+    dir_extension_warned: HashSet<String>,
 }
 
 impl ArchiveStats {
     fn summary(&self) -> String {
         let mut s = format!(
-            "archived {} files ({:.1} MB), {} dirs, {} symlinks; {} path(s) excluded \
+            "archived {} files ({}), {} dirs, {} symlinks; {} path(s) excluded \
              (a pruned directory counts once, with its whole subtree)",
             self.files,
-            self.bytes as f64 / 1_048_576.0,
+            human_size(self.bytes),
             self.dirs,
             self.symlinks,
             self.excluded
@@ -1203,6 +1256,7 @@ mod tests {
             "vault-2026-09-30.tar.gz.tmp-4242",
             "vault-old-2026-09-30.tar.gz.tmp-4242",
             "vault-2026-09-30.tar.gz",
+            "x.tmp-y-2026-09-30.tar.gz.tmp-77",
         ] {
             fs::write(tmp.path().join(name), b"x").unwrap();
         }
@@ -1210,6 +1264,12 @@ mod tests {
         assert!(!tmp.path().join("vault-2026-09-30.tar.gz.tmp-4242").exists());
         assert!(tmp.path().join("vault-old-2026-09-30.tar.gz.tmp-4242").exists());
         assert!(tmp.path().join("vault-2026-09-30.tar.gz").exists());
+
+        // A prefix that itself contains `.tmp-` is still recognised.
+        let mut cfg = test_cfg(tmp.path(), RetentionPolicy::Count(7));
+        cfg.prefix = "x.tmp-y".into();
+        remove_stale_temp_files(&cfg).unwrap();
+        assert!(!tmp.path().join("x.tmp-y-2026-09-30.tar.gz.tmp-77").exists());
     }
 
     fn pat(raw: &str) -> ExcludePattern {
@@ -1263,9 +1323,30 @@ mod tests {
 
     #[test]
     fn exclude_patterns_that_cannot_match_are_rejected() {
-        for bad in ["", "   ", "/", "./", ".", "..", "/abs/path", "a/*/b", "a//b", "a/../b", "*", "**", "?"] {
+        for bad in ["", "   ", "/", "./", ".", "..", "/abs/path", "/name", "a/*/b", "./a*", "a//b", "a/../b", "*", "**", "*?"] {
             assert!(ExcludePattern::parse(bad).is_err(), "{bad:?} should be rejected");
         }
+        // `?` alone only matches one-character names: narrow, but legitimate.
+        assert!(pat("?").matches(Path::new("x"), false));
+        assert!(!pat("?").matches(Path::new("xy"), false));
+    }
+
+    /// `./name` means the root's `name` only; bare `name` means any depth.
+    #[test]
+    fn exclude_dot_slash_anchors_at_the_root() {
+        let p = pat("./build");
+        assert_eq!(p, ExcludePattern::Prefix(PathBuf::from("build")));
+        assert!(p.matches(Path::new("build/out.o"), false));
+        assert!(!p.matches(Path::new("src/build/out.o"), false));
+        assert!(pat("build").matches(Path::new("src/build"), true));
+    }
+
+    #[test]
+    fn exclude_dir_extension_with_trailing_slash() {
+        let p = pat("*.egg-info/");
+        assert_eq!(p, ExcludePattern::DirExtension("egg-info".into()));
+        assert!(p.matches(Path::new("pkg/foo.egg-info"), true));
+        assert!(!p.matches(Path::new("pkg/notes.egg-info"), false));
     }
 
     #[test]
@@ -1285,6 +1366,9 @@ mod tests {
         assert!(!wildcard_match("a?c", "ac"));
         assert!(!wildcard_match("a*c", "abcd"));
         assert!(wildcard_match("*.*.*", "a.b.c"));
+        // A literal `*` in the name must not eat the pattern's wildcard.
+        assert!(wildcard_match("*x", "*yx"));
+        assert!(wildcard_match("*.sync-conflict-*", "*a*.sync-conflict-1.md"));
     }
 
     /// Build a real archive and read it back: excludes prune, `*.ext` spares
