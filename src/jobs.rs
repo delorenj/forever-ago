@@ -195,6 +195,50 @@ impl Job {
     fn same_target(&self, other: &Job) -> bool {
         self.source == other.source && self.dest_dir == other.dest_dir && self.prefix == other.prefix
     }
+
+    // Read-only views for `emma` (adopt/plan compare a manifest to the live job).
+
+    /// The unit or entry name, e.g. `forever-ago-vault.service`.
+    pub(crate) fn unit_name(&self) -> &str {
+        &self.inv.name
+    }
+
+    pub(crate) fn is_systemd(&self) -> bool {
+        matches!(self.inv.scheduler, Scheduler::SystemdUser | Scheduler::SystemdSystem)
+    }
+
+    pub(crate) fn scheduler_label(&self) -> &'static str {
+        self.inv.scheduler.label()
+    }
+
+    pub(crate) fn defined_in(&self) -> &str {
+        &self.inv.defined_in
+    }
+
+    pub(crate) fn argv(&self) -> &[String] {
+        &self.inv.argv
+    }
+
+    pub(crate) fn retention(&self) -> Option<&RetentionPolicy> {
+        self.retention.as_ref()
+    }
+
+    pub(crate) fn exclude_from(&self) -> Option<&Path> {
+        self.exclude_from.as_deref()
+    }
+
+    /// The `--exclude` values on the command line (not those read from `--exclude-from`).
+    pub(crate) fn cli_excludes(&self) -> Vec<String> {
+        flag_values(&self.inv.argv, "--exclude")
+    }
+
+    pub(crate) fn once(&self) -> bool {
+        self.once
+    }
+
+    pub(crate) fn problems(&self) -> &[String] {
+        &self.problems
+    }
 }
 
 /// Where discovery looks. Built from the host in `run`, from temp dirs in tests.

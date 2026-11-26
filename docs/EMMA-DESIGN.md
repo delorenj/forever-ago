@@ -1,6 +1,6 @@
 # Emma on Forever Ago: design (slice 1 build spec)
 
-**Date:** 2026-11-26. **Status:** design only. No product code, capture, deletion, clock change or Candybar/ledger edit accompanies this document.
+**Date:** 2026-11-26. **Status:** slice 1 built in forever-ago 0.4.0 (see [emma.md](emma.md)); the text below is the design it was built from. No product code, capture, deletion, clock change or Candybar/ledger edit accompanies this document.
 **Supersedes and extends:** [INFR-170 research](../../infra/_bmad-output/planning-artifacts/emma-and-growth/research/forever-ago-design.md) (2026-11-24). Where the two disagree, this one wins; section 1 lists every change and why.
 
 > **Belsky level (`belsky-doctrine`).** Jarad asked for a rolling, tiered backup of CandyStore's event history. This builds it for **every project-owned file, folder or consistent export declared by a project's `.emma.toml`**, and CandyStore is the first project to declare one. It is not a backup platform and not an all-host migration. After this ships, the next project to want a backup writes one `.emma.toml` and nothing else.

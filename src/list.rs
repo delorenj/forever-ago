@@ -14,10 +14,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, PartialEq, Eq)]
-struct Snapshot {
-    date: NaiveDate,
-    size: u64,
-    has_checksum: bool,
+pub(crate) struct Snapshot {
+    pub(crate) date: NaiveDate,
+    pub(crate) size: u64,
+    pub(crate) has_checksum: bool,
 }
 
 /// Snapshots of one job's destination, newest first. Jobs that write to the
@@ -136,7 +136,7 @@ fn shelves_for(jobs: &[Job], dir: &Path, cwd: &Path) -> Vec<Shelf> {
 }
 
 /// Archives named `<prefix>-YYYY-MM-DD.tar.gz` in `dest`, newest first.
-fn snapshots_in(dest: &Path, prefix: &str) -> Vec<Snapshot> {
+pub(crate) fn snapshots_in(dest: &Path, prefix: &str) -> Vec<Snapshot> {
     let Ok(rd) = fs::read_dir(dest) else { return Vec::new() };
     let mut snaps: Vec<Snapshot> = rd
         .flatten()

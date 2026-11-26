@@ -1,0 +1,49 @@
+schema_version = 1
+
+# The prune archives. `candystore prune` deletes rows right after fsyncing these
+# files, so this directory is the ONLY copy of every event it has removed.
+[[emmas]]
+id          = "event-archive"
+description = "CandyStore prune archives (jsonl.gz + manifest.json), sole copy of pruned events"
+sole_copy   = true
+
+[emmas.source]
+kind = "files"
+path = "~/backups/candystore/event-archive"   # candystore.retention.DEFAULT_ARCHIVE_DIR; CANDYSTORE_ARCHIVE_DIR can override it
+
+[emmas.capture]
+strategy = "files@1"
+
+[emmas.backend]
+strategy = "restic-local@1"
+repo     = "~/backups/emma/candystore-event-archive.restic"
+
+[emmas.retention]
+strategy = "keep-all@1"
+
+[emmas.fidelity]
+strategy = "full@1"
+
+# The live events table as a rolling, tiered series of full-fidelity restore points.
+[[emmas]]
+id          = "event-export"
+description = "Live CandyStore events (+embeddings) as day-sharded exports; age-buckets restore points"
+
+[emmas.source]
+kind     = "export"
+command  = ["candystore", "export"]            # owner verb requested in section 6.3; does not exist yet
+contract = "shards@1"
+
+[emmas.capture]
+strategy = "command-export@1"
+staging  = "~/.local/state/forever-ago/staging/candystore-event-export"
+
+[emmas.backend]
+strategy = "restic-local@1"
+repo     = "~/backups/emma/candystore-event-export.restic"
+
+[emmas.retention]
+strategy = "age-buckets@1"
+
+[emmas.fidelity]
+strategy = "full@1"

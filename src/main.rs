@@ -14,6 +14,7 @@ use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+mod emma;
 mod jobs;
 mod list;
 
@@ -126,6 +127,26 @@ enum Command {
     /// the current directory itself, walks up its parents (stopping at ~) and
     /// lists the nearest one that has snapshots.
     List,
+
+    /// Register a project's .emma.toml in the local Emma registry.
+    ///
+    /// Validates the manifest, binds it to its pjangler project and records it.
+    /// Registration enables nothing, runs no backup and changes no clock.
+    Register(emma::RegisterArgs),
+
+    /// Print the .emma.toml entry that describes each live legacy job.
+    ///
+    /// With --write, creates <repo_path>/.emma.toml only when it is absent.
+    Adopt(emma::AdoptArgs),
+
+    /// Every registered Emma: schedule, snapshots, independence, coverage. Read-only.
+    Projects(emma::ProjectsArgs),
+
+    /// One Emma in full, and what a future run would still need. Read-only.
+    Plan(emma::PlanArgs),
+
+    /// Retention planning for an Emma. There is no `apply` in this version.
+    Retention(emma::RetentionArgs),
 }
 
 /// How many backups to keep, and by what rule.
@@ -157,6 +178,11 @@ fn main() -> Result<()> {
     match &cli.command {
         Some(Command::Jobs(args)) => return jobs::run(args),
         Some(Command::List) => return list::run(),
+        Some(Command::Register(a)) => std::process::exit(emma::run_register(a)),
+        Some(Command::Adopt(a)) => std::process::exit(emma::run_adopt(a)),
+        Some(Command::Projects(a)) => std::process::exit(emma::run_projects(a)),
+        Some(Command::Plan(a)) => std::process::exit(emma::run_plan(a)),
+        Some(Command::Retention(a)) => std::process::exit(emma::run_retention(a)),
         None => {}
     }
     let prefix = cli

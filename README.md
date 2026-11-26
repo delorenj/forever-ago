@@ -81,38 +81,21 @@ keeps the directory and logs a WARN suggesting `*.ext/`.
 
 ## Scheduling
 
-### systemd timer (recommended)
+**On this host, Candybar is the only clock.** Do not add a systemd timer, a cron entry, a PM2 process or the
+built-in daemon loop for a forever-ago job: register a Candybar whose runner starts
+`forever-ago ... --once` (see the `candybar` skill and `~/code/33GOD/candybar/` docs). A Candybar owns *when*,
+the run history and the receipts; forever-ago owns *what* is captured and how it is thinned. The two live jobs
+(`forever-ago-vault`, `forever-ago-voxxy-voices`) already run that way.
 
-```ini
-# ~/.config/systemd/user/forever-ago-vault.service
-[Service]
-Type=oneshot
-ExecStart=%h/.cargo/bin/forever-ago --source %h/vault --dest-dir %h/backups/vault \
-    --prefix vault --keep-daily 7 --keep-weekly 4 --keep-monthly 4 --once
-
-# ~/.config/systemd/user/forever-ago-vault.timer
-[Timer]
-OnCalendar=*-*-* 03:00:00
-Persistent=true
-
-[Install]
-WantedBy=timers.target
-```
+`--once` is the invocation a Candybar should use: one backup, then exit.
 
 ```bash
-systemctl --user enable --now forever-ago-vault.timer
+forever-ago --source ~/vault --dest-dir ~/backups/vault --prefix vault --retain 7 --once
 ```
 
-### Built-in daemon (e.g. under PM2)
-
-Without `--once`, forever-ago stays running and backs up nightly at `--at` (default `03:00`, local time).
-Add `--run-now` to also back up immediately on startup.
-
-```bash
-pm2 start "$(command -v forever-ago)" --name forever-ago -- \
-  --source "$HOME/.openclaw" --prefix openclaw --retain 7
-pm2 save
-```
+Without `--once`, forever-ago stays running and backs up nightly at `--at` (default `03:00`, local time; `--run-now`
+also backs up on startup). That is a private clock. It remains for hosts that have no Candybar; on a host that
+does, `forever-ago adopt` skips such a job and says so (`W_LEGACY_DAEMON_CLOCK`).
 
 ## Which snapshots exist for this directory?
 
@@ -159,3 +142,20 @@ current directory is excluded from that job, and when a job will never fire
 
 A job whose excludes leave the current directory out does not count as covering
 it, so `jobs` and `list` keep climbing past it and say which job they skipped.
+
+## Emma: project-declared backups
+
+A project declares what it wants backed up in a `.emma.toml` at its root. Forever Ago validates it, records it in
+a derived local registry, and plans it. Version 0.4.0 is **observe-only**: nothing in `register`, `adopt`,
+`projects`, `plan` or `retention plan` captures, prunes, restores or schedules anything, and none of them calls the
+legacy backup path. The legacy flags above behave exactly as before.
+
+```bash
+forever-ago adopt [--write]              # print (or create) the .emma.toml entry that describes each live job
+forever-ago register [PATH|--all] [--dry-run] [--update] [--prune]
+forever-ago projects [--project ID] [--json]     # every Emma: schedule, snapshots, independence, coverage
+forever-ago plan <project/emma> [--measure] [--json]
+forever-ago retention plan <project/emma> [--simulate-daily N] [--as-of RFC3339] [--json]
+```
+
+Full reference: [docs/emma.md](docs/emma.md). Design and decisions: [docs/EMMA-DESIGN.md](docs/EMMA-DESIGN.md).
