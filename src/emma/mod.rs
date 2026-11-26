@@ -220,9 +220,11 @@ fn open_rows(env: &Env) -> Result<(Vec<EmmaRow>, Vec<registry::ManifestRow>), Fi
 }
 
 /// `delodocs/vault`, or `vault` when exactly one non-retired Emma has that id.
+/// Split at the LAST `/`: an Emma id is a slug, but an unbound project key is
+/// `path:/abs/root`, so its label is `path:/abs/root/<emma>`.
 pub fn resolve_emma<'a>(rows: &'a [EmmaRow], spec: &str) -> Result<&'a EmmaRow, (i32, Finding)> {
     let live = |r: &&EmmaRow| r.sync_state != "retired";
-    let found: Vec<&EmmaRow> = match spec.split_once('/') {
+    let found: Vec<&EmmaRow> = match spec.rsplit_once('/') {
         Some((p, e)) => rows.iter().filter(|r| r.project_key == p && r.emma_id == e).collect(),
         None => {
             let all: Vec<&EmmaRow> = rows.iter().filter(|r| r.emma_id == spec).collect();

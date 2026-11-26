@@ -20,14 +20,16 @@ Design, ownership decisions and the parked questions: [EMMA-DESIGN.md](EMMA-DESI
 
 ### `register [PATH | --all]`
 Loads `.emma.toml` (searching upward from PATH to the git toplevel), validates it, binds it to its pjangler
-project and records it. `--all` visits `<repo_path>/.emma.toml` for every pjangler project (no home scan).
+project and records it. PATH is a directory or a file named `.emma.toml`; any other file is refused
+(`E_NO_MANIFEST`, exit 2), so an example or a copy can never declare another project's Emmas. `--all` visits `<repo_path>/.emma.toml` for every pjangler project (no home scan).
 `--dry-run` writes nothing, not even the state directory. Re-running is a no-op (`unchanged`).
 
 | State | Meaning | Exit |
 |---|---|---|
 | `new`, `unchanged` | | 0 |
 | `drift:<fields>` | manifest changed since registration; applied only with `--update` | 6 |
-| `moved` | same project, new path; `--update` applies it | 6 |
+| `moved` | same project, new path; `--update` applies it. `--all` never orphans or retires a moved Emma | 6 |
+| `identity-changed` | the manifest's project was renamed in pjangler; `--update` rekeys it (history moves with it). Until then nothing is rebound | 6 |
 | `orphan` | registered Emma no longer in the manifest; `--prune` marks it `retired` (rows and history are never deleted) | 0 |
 | `conflict:duplicate-owner`, destination collision, manifest in a linked worktree (`E_NOT_OWNER`) | refused, nothing changed | 3 |
 | invalid manifest | last valid definition is kept and the manifest is marked `invalid` | 2 |
@@ -54,7 +56,9 @@ nothing here can prove a backup is restorable or off-host. Independence is `same
 Which restore points the declared retention would keep and forget, as a table, with a `plan_digest` over canonical
 JSON that does not depend on input order. There is **no `retention apply`** in this version (usage error, exit 2).
 `--simulate-daily N` previews on N synthetic daily snapshots ending at `--as-of`; `--inventory-json FILE` previews on
-your own list of `{id, captured_at, status?, hold?, generation?, fidelity?}`.
+your own list of `{id, captured_at, status?, hold?, generation?, fidelity?}`. Snapshot ids must be unique (a repeated
+id is refused, never folded into one decision); `--simulate-daily` stops at 36525 days. `<project/emma>` splits at
+the last `/`, so an unbound project's label `path:/abs/root/<emma>` is accepted as printed.
 
 ## `.emma.toml` (schema_version = 1)
 

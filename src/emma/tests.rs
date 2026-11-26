@@ -1329,3 +1329,28 @@ fn register_takes_only_a_file_named_emma_toml() {
     assert_eq!(codes(&o), vec!["E_NO_MANIFEST"]);
     assert!(fx.rows().is_empty());
 }
+
+#[test]
+fn an_unbound_project_label_resolves_even_though_its_key_has_slashes() {
+    // Unbound keys are `path:/abs/root`; the label printed for an ambiguous
+    // id must itself be accepted back as `project/emma`.
+    let fx = Fx::new();
+    let mut labels = Vec::new();
+    for name in ["loose-a", "loose-b"] {
+        let d = fx.home.join(name);
+        fs::create_dir_all(d.join("data")).unwrap();
+        fs::create_dir_all(d.join(".git")).unwrap();
+        fs::write(d.join(MANIFEST_NAME), files_manifest("data", "data", &format!("~/backups/{name}"), r#"strategy = "keep-all@1""#)).unwrap();
+        assert_eq!(fx.reg(Some(&d), false, false, false, false).exit, exit::OK);
+        labels.push(format!("path:{}/data", d.display()));
+    }
+    let mut env = fx.env();
+    let (code, _, _, f) = plan_one(&mut env, "data", None, true);
+    assert_eq!(code, exit::USAGE);
+    assert!(f[0].message.contains(&labels[0]), "{f:?}");
+    for l in &labels {
+        let (code, e, _, f) = plan_one(&mut env, l, None, true);
+        assert_eq!(code, exit::OK, "{l}: {f:?}");
+        assert_eq!(e["label"].as_str(), Some(l.as_str()));
+    }
+}
