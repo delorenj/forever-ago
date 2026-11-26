@@ -1129,3 +1129,203 @@ fn json_envelope_shape() {
     assert_eq!(env["exit"], 6);
     assert_eq!(env["findings"][0]["severity"], "warning");
 }
+
+// ---------------------------------------------------------------------------
+// Adversarial review (2026-11-26): each test below failed against 439822d.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_exact_live_unit_argv_parses_as_before() {
+    // Verbatim ExecStart argv of the two Candybar-started units
+    // (~/docker/systemd/user/forever-ago-{vault,voxxy-voices}.service).
+    use clap::Parser as _;
+    let vault = crate::Cli::try_parse_from([
+        "/home/delorenj/code/forever-ago/target/release/forever-ago",
+        "--source", "/home/delorenj/code/DeLoDocs",
+        "--dest-dir", "/home/delorenj/backups/delodocs",
+        "--prefix", "vault",
+        "--exclude-from", "/home/delorenj/code/DeLoDocs/.backup-exclude",
+        "--retain", "3",
+        "--once",
+    ])
+    .unwrap();
+    assert!(vault.command.is_none());
+    assert_eq!(vault.source, PathBuf::from("/home/delorenj/code/DeLoDocs"));
+    assert_eq!(vault.dest_dir.as_deref(), Some(Path::new("/home/delorenj/backups/delodocs")));
+    assert_eq!(vault.prefix.as_deref(), Some("vault"));
+    assert_eq!(vault.exclude_from.as_deref(), Some(Path::new("/home/delorenj/code/DeLoDocs/.backup-exclude")));
+    assert!(vault.excludes.is_empty());
+    assert!(vault.once && !vault.run_now);
+    assert_eq!(crate::retention_policy(&vault).unwrap(), crate::RetentionPolicy::Count(3));
+
+    let voices = crate::Cli::try_parse_from([
+        "/home/delorenj/.cargo/bin/forever-ago",
+        "--source", "/home/delorenj/code/voxxy/voices",
+        "--dest-dir", "/home/delorenj/backups",
+        "--prefix", "voxxy-voices",
+        "--exclude", "*.aup4",
+        "--exclude", "*.aup4-wal",
+        "--exclude", "*.aup4-shm",
+        "--retain", "1",
+        "--once",
+    ])
+    .unwrap();
+    assert!(voices.command.is_none());
+    assert_eq!(voices.excludes, vec!["*.aup4", "*.aup4-wal", "*.aup4-shm"]);
+    assert!(voices.exclude_from.is_none());
+    assert!(voices.once);
+    assert_eq!(crate::retention_policy(&voices).unwrap(), crate::RetentionPolicy::Count(1));
+}
+
+#[test]
+fn a_destination_spelled_through_a_missing_dir_and_dotdot_is_still_inside_the_source() {
+    // `missing/..` is the manifest dir once `missing` is created, so this
+    // destination is proj/data/bk: inside the source. 439822d dropped the
+    // `..` and saw proj/missing/data/bk.
+    let (_t, root) = scratch();
+    let p = root.join("proj");
+    let keep = r#"strategy = "keep-all@1""#;
+    assert_eq!(parse_in(&p, &root, &files_manifest("data", "data", "missing/../data/bk", keep)).1, vec!["E_DEST_INSIDE_SOURCE"]);
+    assert_eq!(parse_in(&p, &root, &files_manifest("data", "data", "a/b/../../data", keep)).1, vec!["E_DEST_INSIDE_SOURCE"]);
+    let (defs, codes) = parse_in(&p, &root, &files_manifest("data", "data", "missing/../../b", keep));
+    assert!(codes.is_empty(), "{codes:?}");
+    assert_eq!(defs[0].dest_canonical.as_deref(), Some(root.join("b").as_path()));
+    // Through a symlink that does exist, then a missing tail: still resolved.
+    symlink(p.join("data"), p.join("link")).unwrap();
+    assert_eq!(parse_in(&p, &root, &files_manifest("data", "data", "link/new/../bk", keep)).1, vec!["E_DEST_INSIDE_SOURCE"]);
+    assert_eq!(manifest::canonical_lenient(&p.join("missing/../data/bk")), p.join("data/bk"));
+}
+
+#[test]
+fn duplicate_snapshot_ids_are_refused_not_collapsed() {
+    let t = as_of() - chrono::Duration::days(40);
+    let snaps = vec![Snap::new("dup", t), Snap::new("dup", t - chrono::Duration::days(1)), Snap::new("recent", as_of() - chrono::Duration::hours(1))];
+    for s in ["age-buckets@1", "keep-all@1", "legacy-count@1"] {
+        let err = retention::plan(s, &json!({"keep": 1}), &snaps, as_of()).unwrap_err();
+        assert!(err.contains("dup"), "{s}: {err}");
+    }
+    let fx = Fx::new();
+    let p = fx.project("candystore", "code/33GOD/candystore");
+    fs::create_dir_all(fx.home.join("backups/candystore/event-archive")).unwrap();
+    fs::write(p.join(MANIFEST_NAME), CANDYSTORE_MANIFEST).unwrap();
+    fx.reg(Some(&p), false, false, false, false);
+    let inv = fx.home.join("inv.json");
+    fs::write(&inv, r#"[{"id":"a","captured_at":"2026-11-25T00:00:00Z"},{"id":"a","captured_at":"2026-09-01T00:00:00Z"}]"#).unwrap();
+    let a = RetentionPlanArgs { emma: "event-export".into(), as_of: Some("2026-11-26T12:00:00Z".into()), simulate_daily: None, inventory_json: Some(inv), json: true };
+    let (code, _, _, f) = retention_plan(&fx.env(), &a);
+    assert_eq!(code, exit::USAGE, "{f:?}");
+}
+
+#[test]
+fn simulate_daily_is_bounded() {
+    let fx = Fx::new();
+    let p = fx.project("candystore", "code/33GOD/candystore");
+    fs::create_dir_all(fx.home.join("backups/candystore/event-archive")).unwrap();
+    fs::write(p.join(MANIFEST_NAME), CANDYSTORE_MANIFEST).unwrap();
+    fx.reg(Some(&p), false, false, false, false);
+    let args = |n: u32| RetentionPlanArgs { emma: "event-export".into(), as_of: Some("2026-11-26T12:00:00Z".into()), simulate_daily: Some(n), inventory_json: None, json: true };
+    let started = std::time::Instant::now();
+    let (code, _, _, f) = retention_plan(&fx.env(), &args(u32::MAX));
+    assert_eq!(code, exit::USAGE, "{f:?}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(2), "refused before allocating");
+    assert_eq!(retention_plan(&fx.env(), &args(retention::MAX_SIMULATE_DAYS)).0, exit::OK);
+}
+
+/// A files Emma in project `id`, then `pj rename` it to `new_id`.
+fn renamed_fixture(fx: &Fx, id: &str, new_id: &str) -> PathBuf {
+    let p = fx.project(id, &format!("code/{id}"));
+    fs::create_dir_all(p.join("data")).unwrap();
+    fs::write(p.join(MANIFEST_NAME), files_manifest("data", "data", "~/backups", r#"strategy = "keep-all@1""#)).unwrap();
+    assert_eq!(fx.reg(Some(&p), false, false, false, false).exit, exit::OK);
+    fs::write(p.join(".fakepj"), new_id).unwrap();
+    p
+}
+
+#[test]
+fn a_pj_rename_is_identity_changed_not_a_destination_collision() {
+    let fx = Fx::new();
+    let p = renamed_fixture(&fx, "alpha", "alpha2");
+    let o = fx.reg(Some(&p), false, false, false, false);
+    assert_eq!(o.exit, exit::DRIFT, "{:?}", o.findings);
+    assert_eq!(states(&o), vec!["identity-changed"]);
+    let u = fx.reg(Some(&p), false, false, true, false);
+    assert_eq!(u.exit, exit::OK, "{:?}", u.findings);
+    let rows = fx.rows();
+    assert_eq!(rows.len(), 1);
+    assert_eq!((rows[0].project_key.as_str(), rows[0].generation, rows[0].sync_state.as_str()), ("alpha2", 1, "ok"));
+    assert_eq!(fx.reg(Some(&p), false, false, false, false).exit, exit::OK);
+}
+
+#[test]
+fn an_unapplied_identity_change_is_still_reported_on_the_next_run() {
+    let fx = Fx::new();
+    let p = renamed_fixture(&fx, "alpha", "alpha2");
+    let before = fx.rows();
+    for _ in 0..2 {
+        let o = fx.reg(Some(&p), false, false, false, false);
+        assert_eq!(o.exit, exit::DRIFT, "{:?}", o.findings);
+        assert_eq!(states(&o), vec!["identity-changed"]);
+    }
+    assert_eq!(fx.rows(), before, "observation alone never rekeys or duplicates a row");
+    let reg = Registry::open_read(&fx.state).unwrap().unwrap();
+    assert_eq!(reg.manifests().unwrap()[0].project_key, "alpha", "the manifest stays bound to its registered key");
+}
+
+#[test]
+fn register_all_after_a_move_never_orphans_or_retires_the_moved_emma() {
+    let fx = Fx::new();
+    let p = fx.project("alpha", "code/alpha");
+    fs::create_dir_all(p.join("data")).unwrap();
+    fs::write(p.join(MANIFEST_NAME), files_manifest("data", "data", "~/backups", r#"strategy = "keep-all@1""#)).unwrap();
+    assert_eq!(fx.reg(None, true, false, false, false).exit, exit::OK);
+    let moved = fx.home.join("code/alpha-moved");
+    fs::rename(&p, &moved).unwrap();
+    fx.projects.borrow_mut()[0].1 = moved.clone();
+    fx.write_projects();
+
+    // Observed, not applied: the row keeps its state (and --prune cannot retire it).
+    let o = fx.reg(None, true, false, false, true);
+    assert_eq!(o.exit, exit::DRIFT, "{:?}", o.findings);
+    assert_eq!(states(&o), vec!["moved"]);
+    assert_eq!(fx.rows()[0].sync_state, "ok", "a move is not an orphan");
+
+    let u = fx.reg(None, true, false, true, false);
+    assert_eq!(u.exit, exit::OK, "{:?}", u.findings);
+    let rows = fx.rows();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].sync_state, "ok");
+    assert!(rows[0].manifest_path.starts_with(&moved.display().to_string()));
+    let reg = Registry::open_read(&fx.state).unwrap().unwrap();
+    let old = reg.manifests().unwrap().into_iter().find(|m| m.manifest_path.contains("/alpha/")).unwrap();
+    assert_eq!(old.state, "moved");
+}
+
+#[test]
+fn an_unreadable_registry_fails_closed_instead_of_reading_as_empty() {
+    let fx = Fx::new();
+    let p = fx.project("alpha", "code/alpha");
+    fs::create_dir_all(p.join("data")).unwrap();
+    fs::write(p.join(MANIFEST_NAME), files_manifest("data", "data", "~/backups", r#"strategy = "keep-all@1""#)).unwrap();
+    fs::create_dir_all(&fx.state).unwrap();
+    let c = rusqlite::Connection::open(fx.state.join(registry::DB_NAME)).unwrap();
+    c.execute_batch("PRAGMA user_version = 1;").unwrap();
+    drop(c);
+    for dry in [true, false] {
+        let o = fx.reg(Some(&p), false, dry, false, false);
+        assert_eq!(o.exit, exit::FAILURE, "dry_run={dry}: {:?}", o.findings);
+        assert!(codes(&o).contains(&"E_REGISTRY".to_string()), "{:?}", codes(&o));
+    }
+}
+
+#[test]
+fn register_takes_only_a_file_named_emma_toml() {
+    let fx = Fx::new();
+    let p = fx.project("alpha", "code/alpha");
+    fs::create_dir_all(p.join("data")).unwrap();
+    let other = p.join("example.emma.toml");
+    fs::write(&other, files_manifest("data", "data", "~/backups", r#"strategy = "keep-all@1""#)).unwrap();
+    let o = fx.reg(Some(&other), false, false, false, false);
+    assert_eq!(o.exit, exit::USAGE, "{:?}", o.findings);
+    assert_eq!(codes(&o), vec!["E_NO_MANIFEST"]);
+    assert!(fx.rows().is_empty());
+}

@@ -11,6 +11,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 pub const DAY: i64 = 86_400;
 
+/// The longest `--simulate-daily` what-if: a century of daily snapshots.
+pub const MAX_SIMULATE_DAYS: u32 = 36_525;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SnapStatus {
     Success,
@@ -315,6 +318,12 @@ fn ts(t: &DateTime<Utc>) -> String {
 
 /// Plan one strategy over an inventory. `Err` is a refusal message.
 pub fn plan(strategy: &str, params: &Json, snaps: &[Snap], as_of: DateTime<Utc>) -> Result<Plan, String> {
+    // Decisions are keyed by id: a repeated id would silently fold two
+    // restore points into one decision (and make the digest order-dependent).
+    let mut ids = HashSet::new();
+    if let Some(dup) = snaps.iter().find(|s| !ids.insert(s.id.as_str())) {
+        return Err(format!("snapshot id {:?} appears more than once in the inventory; refusing to plan", dup.id));
+    }
     let legacy = strategy.starts_with("legacy-");
     // Legacy rules count every archive, as the legacy prune does; the other
     // strategies only ever select among successful full-fidelity snapshots.

@@ -13,7 +13,7 @@ use serde_json::{json, Value as Json};
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use toml::{Table, Value};
 
 pub const MANIFEST_NAME: &str = ".emma.toml";
@@ -130,26 +130,46 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 /// The nearest existing ancestor, canonicalised, with the rest appended:
 /// a not-yet-created restic repo under a symlinked directory still compares
 /// equal to its real location.
+///
+/// Walked one component at a time: every prefix that exists is resolved
+/// (symlinks included). A missing component is a directory-to-be, so a later
+/// `..` steps back out of it lexically, as `mkdir -p` would, and resolution
+/// resumes once the walk is back on existing ground. Dropping that `..` (as a
+/// parent-walk does, since `Path::file_name` of `x/..` is None) would let
+/// `missing/../src/bk` hide a destination inside its own source.
 pub fn canonical_lenient(path: &Path) -> PathBuf {
     if let Ok(p) = fs::canonicalize(path) {
         return p;
     }
-    let mut rest = Vec::new();
-    let mut cur = path.to_path_buf();
-    while let Some(parent) = cur.parent().map(Path::to_path_buf) {
-        if let Some(name) = cur.file_name() {
-            rest.push(name.to_os_string());
-        }
-        if let Ok(p) = fs::canonicalize(&parent) {
-            let mut out = p;
-            for n in rest.iter().rev() {
-                out.push(n);
-            }
-            return out;
-        }
-        cur = parent;
+    if !path.is_absolute() {
+        return canonical_or_normalized(path);
     }
-    canonical_or_normalized(path)
+    let mut out = PathBuf::new();
+    // Components pushed since the walk left existing ground; 0 means `out` is canonical.
+    let mut missing = 0usize;
+    for c in path.components() {
+        match c {
+            Component::Prefix(_) | Component::RootDir => out.push(c),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                // Canonical `out` has no symlinks, so popping is the real `..`.
+                out.pop();
+                missing = missing.saturating_sub(1);
+            }
+            Component::Normal(name) => {
+                let next = out.join(name);
+                if missing == 0
+                    && let Ok(p) = fs::canonicalize(&next)
+                {
+                    out = p;
+                } else {
+                    out = next;
+                    missing += 1;
+                }
+            }
+        }
+    }
+    out
 }
 
 pub struct Loaded {

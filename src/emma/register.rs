@@ -148,6 +148,14 @@ pub fn register(opts: &RegisterOpts, env: &mut Env, cwd: &Path) -> Outcome {
         let start = opts.path.clone().unwrap_or_else(|| cwd.to_path_buf());
         let start = if start.is_absolute() { start } else { cwd.join(start) };
         if start.is_file() {
+            // One manifest per project, at a fixed name: any other file
+            // (an example, a copy) would let a repo declare someone else's Emmas.
+            if start.file_name().and_then(|n| n.to_str()) != Some(MANIFEST_NAME) {
+                return Outcome::fail(
+                    exit::USAGE,
+                    Finding::of("E_NO_MANIFEST", format!("{} is not a {MANIFEST_NAME}; pass the project directory or its {MANIFEST_NAME}", start.display())),
+                );
+            }
             targets.push(start);
         } else if start.is_dir() {
             match find_manifest(&canonical_or_normalized(&start), &home) {
@@ -260,20 +268,31 @@ pub fn register(opts: &RegisterOpts, env: &mut Env, cwd: &Path) -> Outcome {
     }
 
     // 6. The registry: locked for writing, or read-only for --dry-run.
+    // A registry that opens but cannot be read fails closed: read as empty,
+    // every Emma would classify as `new` and nothing would look orphaned.
+    let read_rows = |r: &Registry| -> Result<(Vec<EmmaRow>, Vec<ManifestRow>), Finding> {
+        let e = |err: rusqlite::Error| Finding::of("E_REGISTRY", format!("cannot read the registry: {err}"));
+        Ok((r.emmas().map_err(e)?, r.manifests().map_err(e)?))
+    };
     let mut reg_w: Option<Registry> = None;
     let (rows, manifests): (Vec<EmmaRow>, Vec<ManifestRow>) = if opts.dry_run {
         match Registry::open_read(&env.state_dir) {
-            Ok(Some(r)) => (r.emmas().unwrap_or_default(), r.manifests().unwrap_or_default()),
+            Ok(Some(r)) => match read_rows(&r) {
+                Ok(x) => x,
+                Err(f) => return Outcome::fail(exit::FAILURE, f),
+            },
             Ok(None) => (Vec::new(), Vec::new()),
             Err(f) => return Outcome::fail(exit::FAILURE, f),
         }
     } else {
         match Registry::open_write(&env.state_dir) {
             Ok(r) => {
-                let rows = r.emmas().unwrap_or_default();
-                let ms = r.manifests().unwrap_or_default();
+                let x = match read_rows(&r) {
+                    Ok(x) => x,
+                    Err(f) => return Outcome::fail(exit::FAILURE, f),
+                };
                 reg_w = Some(r);
-                (rows, ms)
+                x
             }
             Err((code, f)) => return Outcome::fail(code, f),
         }
@@ -337,10 +356,14 @@ pub fn register(opts: &RegisterOpts, env: &mut Env, cwd: &Path) -> Outcome {
         }
     }
 
-    // Destination claims after this run: E_DEST_COLLISION.
+    // Destination claims after this run: E_DEST_COLLISION. A row this run
+    // accounts for (same key, or the old key of a `pj rename`) is the same
+    // Emma, never a second claimant.
     let in_run: HashSet<(String, String)> = items.iter().map(|i| (i.key.clone(), i.emma.id.clone())).collect();
+    let claimed: HashSet<(String, String)> =
+        in_run.iter().cloned().chain(items.iter().filter_map(|i| i.old.as_ref().map(|r| (r.project_key.clone(), r.emma_id.clone())))).collect();
     let mut claims: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
-    for r in rows.iter().filter(|r| r.sync_state != "retired" && !in_run.contains(&(r.project_key.clone(), r.emma_id.clone()))) {
+    for r in rows.iter().filter(|r| r.sync_state != "retired" && !claimed.contains(&(r.project_key.clone(), r.emma_id.clone()))) {
         if let Some(d) = &r.dest_canonical {
             let prefix = r.definition["backend"]["prefix"].as_str().unwrap_or("").to_string();
             claims.entry((d.clone(), prefix)).or_default().push(r.label());
@@ -454,6 +477,14 @@ pub fn register(opts: &RegisterOpts, env: &mut Env, cwd: &Path) -> Outcome {
         }
         for l in loaded.iter().filter(|l| l.ok()) {
             let Some(id) = idents.get(&l.path) else { continue };
+            // An identity change waits for --update: rebinding the manifest
+            // now would erase the only evidence of the rename, and the next
+            // run would register the same Emmas again under the new key.
+            let pending_rekey = !opts.update
+                && items.iter().any(|i| i.manifest.path == l.path && matches!(i.state, State::IdentityChanged { .. }));
+            if pending_rekey {
+                continue;
+            }
             let key = id.project_key();
             tx.upsert_project(&key, id.kind(), id.project_id(), &id.repo_path().display().to_string())?;
             tx.upsert_manifest(&l.path.display().to_string(), &key, &l.sha256, "ok", None)?;
@@ -495,9 +526,20 @@ pub fn register(opts: &RegisterOpts, env: &mut Env, cwd: &Path) -> Outcome {
         for (r, _) in &orphans {
             tx.set_sync_state(&r.project_key, &r.emma_id, if opts.prune { "retired" } else { "orphan" })?;
         }
+        // A manifest that vanished because its repo moved is not an orphan
+        // source: the Emmas this run found at the new path stay as they are
+        // (applied above under --update, left untouched otherwise).
+        let moved_from: HashSet<&str> = items
+            .iter()
+            .filter_map(|i| if let State::Moved { from } = &i.state { Some(from.as_str()) } else { None })
+            .collect();
         for m in &vanished {
-            tx.mark_manifest(&m.manifest_path, "missing", None)?;
-            for r in rows.iter().filter(|r| r.manifest_path == m.manifest_path && r.sync_state != "retired") {
+            if !(opts.update && moved_from.contains(m.manifest_path.as_str())) {
+                tx.mark_manifest(&m.manifest_path, "missing", None)?;
+            }
+            for r in rows.iter().filter(|r| {
+                r.manifest_path == m.manifest_path && r.sync_state != "retired" && !claimed.contains(&(r.project_key.clone(), r.emma_id.clone()))
+            }) {
                 tx.set_sync_state(&r.project_key, &r.emma_id, if opts.prune { "retired" } else { "orphan" })?;
             }
         }

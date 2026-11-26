@@ -339,11 +339,15 @@ fn inventory_from_json(path: &Path) -> Result<Vec<retention::Snap>, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     let v: Json = serde_json::from_str(&text).map_err(|e| format!("{} is not JSON: {e}", path.display()))?;
     let items = v.as_array().or_else(|| v.get("snapshots").and_then(Json::as_array)).ok_or("expected a JSON array of snapshots")?;
+    let mut seen = std::collections::HashSet::new();
     items
         .iter()
         .enumerate()
         .map(|(i, s)| {
             let id = s.get("id").and_then(Json::as_str).ok_or(format!("snapshot {i}: missing id"))?;
+            if !seen.insert(id.to_string()) {
+                return Err(format!("snapshot {i}: id {id:?} appears more than once"));
+            }
             let at = s.get("captured_at").and_then(Json::as_str).ok_or(format!("snapshot {i}: missing captured_at"))?;
             let mut snap = retention::Snap::new(id, parse_time(at)?);
             if let Some(st) = s.get("status").and_then(Json::as_str) {
@@ -379,6 +383,14 @@ pub fn retention_plan(env: &Env, a: &RetentionPlanArgs) -> (i32, Json, String, V
         return fail(exit::REFUSED, Finding::of("E_SOLE_COPY_RETENTION", format!("{} is a sole copy; {strategy} would thin it", row.label())));
     }
     let mut findings = Vec::new();
+    if let Some(n) = a.simulate_daily
+        && n > retention::MAX_SIMULATE_DAYS
+    {
+        return fail(
+            exit::USAGE,
+            Finding::of("E_USAGE", format!("--simulate-daily {n} is over the {} day (100 year) limit", retention::MAX_SIMULATE_DAYS)),
+        );
+    }
     let (snaps, what_if, source) = if let Some(n) = a.simulate_daily {
         (retention::simulate_daily(n, as_of), true, format!("simulated: one snapshot per day for {n} days ending {}", as_of.format("%Y-%m-%d")))
     } else if let Some(p) = &a.inventory_json {
@@ -401,7 +413,7 @@ pub fn retention_plan(env: &Env, a: &RetentionPlanArgs) -> (i32, Json, String, V
     };
     let p = match retention::plan(&strategy, &params, &snaps, as_of) {
         Ok(p) => p,
-        Err(e) => return fail(exit::REFUSED, Finding::of("E_UNKNOWN_STRATEGY", e)),
+        Err(e) => return fail(exit::REFUSED, Finding::of(if e.contains("unknown retention strategy") { "E_UNKNOWN_STRATEGY" } else { "E_PLAN_REFUSED" }, e)),
     };
     let mut data = retention::to_json(&p, what_if);
     data["emma"] = json!(row.label());
