@@ -312,8 +312,10 @@ fn legacy_partition(generation: i64, snaps: &[Snap], policy: &RetentionPolicy) -
     flat_partition(generation, snaps, &keep, &format!("legacy:{rule}"), &format!("legacy:beyond-{rule}"))
 }
 
+/// RFC 3339 UTC with every non-zero sub-second digit, so a recorded `as_of`
+/// replays to the same plan (whole seconds print as before).
 fn ts(t: &DateTime<Utc>) -> String {
-    t.to_rfc3339_opts(SecondsFormat::Secs, true)
+    t.to_rfc3339_opts(SecondsFormat::AutoSi, true)
 }
 
 /// Plan one strategy over an inventory. `Err` is a refusal message.

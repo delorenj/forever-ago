@@ -24,7 +24,7 @@ pub mod strategies;
 mod tests;
 
 use crate::jobs::Job;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SubsecRound as _, Utc};
 use envelope::{emit, exit, Finding};
 use registry::{EmmaRow, Registry};
 use serde_json::{json, Value as Json};
@@ -337,7 +337,11 @@ pub fn tar_inventory(dest: &Path, prefix: &str) -> Vec<retention::Snap> {
     out
 }
 
+/// A supplied inventory is a closed schema, like a manifest: a mistyped key or
+/// value is an error, never a default. A silently dropped `hold` would plan a
+/// held restore point for forgetting.
 fn inventory_from_json(path: &Path) -> Result<Vec<retention::Snap>, String> {
+    const KEYS: [&str; 6] = ["id", "captured_at", "status", "hold", "generation", "fidelity"];
     let text = std::fs::read_to_string(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     let v: Json = serde_json::from_str(&text).map_err(|e| format!("{} is not JSON: {e}", path.display()))?;
     let items = v.as_array().or_else(|| v.get("snapshots").and_then(Json::as_array)).ok_or("expected a JSON array of snapshots")?;
@@ -346,18 +350,32 @@ fn inventory_from_json(path: &Path) -> Result<Vec<retention::Snap>, String> {
         .iter()
         .enumerate()
         .map(|(i, s)| {
-            let id = s.get("id").and_then(Json::as_str).ok_or(format!("snapshot {i}: missing id"))?;
+            let obj = s.as_object().ok_or(format!("snapshot {i}: expected an object"))?;
+            if let Some(k) = obj.keys().find(|k| !KEYS.contains(&k.as_str())) {
+                return Err(format!("snapshot {i}: unknown key {k:?}; allowed: {}", KEYS.join(", ")));
+            }
+            let string = |k: &str| -> Result<Option<&str>, String> {
+                match obj.get(k) {
+                    None | Some(Json::Null) => Ok(None),
+                    Some(Json::String(s)) => Ok(Some(s.as_str())),
+                    Some(other) => Err(format!("snapshot {i}: {k} must be a string, got {other}")),
+                }
+            };
+            let id = string("id")?.ok_or(format!("snapshot {i}: missing id"))?;
             if !seen.insert(id.to_string()) {
                 return Err(format!("snapshot {i}: id {id:?} appears more than once"));
             }
-            let at = s.get("captured_at").and_then(Json::as_str).ok_or(format!("snapshot {i}: missing captured_at"))?;
+            let at = string("captured_at")?.ok_or(format!("snapshot {i}: missing captured_at"))?;
             let mut snap = retention::Snap::new(id, parse_time(at)?);
-            if let Some(st) = s.get("status").and_then(Json::as_str) {
+            if let Some(st) = string("status")? {
                 snap.status = retention::SnapStatus::parse(st).ok_or(format!("snapshot {i}: unknown status {st:?}"))?;
             }
-            snap.hold = s.get("hold").and_then(Json::as_str).map(str::to_string);
-            snap.generation = s.get("generation").and_then(Json::as_i64).unwrap_or(1);
-            if let Some(f) = s.get("fidelity").and_then(Json::as_str) {
+            snap.hold = string("hold")?.map(str::to_string);
+            snap.generation = match obj.get("generation") {
+                None | Some(Json::Null) => 1,
+                Some(g) => g.as_i64().ok_or(format!("snapshot {i}: generation must be an integer, got {g}"))?,
+            };
+            if let Some(f) = string("fidelity")? {
                 snap.fidelity = f.to_string();
             }
             snap.time_source = "supplied";
@@ -377,7 +395,8 @@ pub fn retention_plan(env: &Env, a: &RetentionPlanArgs) -> (i32, Json, String, V
         Err((code, f)) => return fail(code, f),
     };
     let as_of = match a.as_of.as_deref().map(parse_time).transpose() {
-        Ok(t) => t.unwrap_or_else(Utc::now),
+        // Default: now, in whole seconds, so the recorded value is the one planned with.
+        Ok(t) => t.unwrap_or_else(|| Utc::now().trunc_subsecs(0)),
         Err(e) => return fail(exit::USAGE, Finding::of("E_USAGE", e)),
     };
     let (strategy, params) = row.strategy("retention");

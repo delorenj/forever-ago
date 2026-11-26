@@ -1354,3 +1354,50 @@ fn an_unbound_project_label_resolves_even_though_its_key_has_slashes() {
         assert_eq!(e["label"].as_str(), Some(l.as_str()));
     }
 }
+
+#[test]
+fn a_supplied_inventory_is_a_closed_schema_so_a_hold_is_never_dropped() {
+    let fx = Fx::new();
+    let p = fx.project("candystore", "code/33GOD/candystore");
+    fs::create_dir_all(fx.home.join("backups/candystore/event-archive")).unwrap();
+    fs::write(p.join(MANIFEST_NAME), CANDYSTORE_MANIFEST).unwrap();
+    fx.reg(Some(&p), false, false, false, false);
+    let inv = fx.home.join("inv.json");
+    let run = |body: &str| {
+        fs::write(&inv, body).unwrap();
+        let a = RetentionPlanArgs { emma: "event-export".into(), as_of: Some("2026-11-26T12:00:00Z".into()), simulate_daily: None, inventory_json: Some(inv.clone()), json: true };
+        retention_plan(&fx.env(), &a)
+    };
+    let ok = r#"{"id":"a","captured_at":"2026-11-25T00:00:00Z"}"#;
+    assert_eq!(run(&format!("[{ok}]")).0, exit::OK);
+    for bad in [
+        r#"{"id":"b","captured_at":"2026-01-01T00:00:00Z","hold":true}"#,
+        r#"{"id":"b","captured_at":"2026-01-01T00:00:00Z","hold_":"legal"}"#,
+        r#"{"id":"b","captured_at":"2026-01-01T00:00:00Z","status":1}"#,
+        r#"{"id":"b","captured_at":"2026-01-01T00:00:00Z","generation":"2"}"#,
+        r#"{"id":"b","captured_at":"2026-01-01T00:00:00Z","fidelity":7}"#,
+        r#""b""#,
+    ] {
+        let (code, _, _, f) = run(&format!("[{ok},{bad}]"));
+        assert_eq!(code, exit::USAGE, "{bad}: {f:?}");
+    }
+    // `hold: null` means no hold.
+    assert_eq!(run(&format!(r#"[{ok},{{"id":"c","captured_at":"2026-01-01T00:00:00Z","hold":null}}]"#)).0, exit::OK);
+}
+
+#[test]
+fn the_recorded_as_of_reproduces_the_plan() {
+    let fx = Fx::new();
+    let p = fx.project("candystore", "code/33GOD/candystore");
+    fs::create_dir_all(fx.home.join("backups/candystore/event-archive")).unwrap();
+    fs::write(p.join(MANIFEST_NAME), CANDYSTORE_MANIFEST).unwrap();
+    fx.reg(Some(&p), false, false, false, false);
+    let args = |at: Option<&str>| RetentionPlanArgs { emma: "event-export".into(), as_of: at.map(str::to_string), simulate_daily: Some(30), inventory_json: None, json: true };
+    let (_, d, _, _) = retention_plan(&fx.env(), &args(Some("2026-11-26T12:00:00.750Z")));
+    assert_eq!(d["as_of"].as_str(), Some("2026-11-26T12:00:00.750Z"), "a supplied as_of is recorded exactly");
+    let (_, d, _, _) = retention_plan(&fx.env(), &args(None));
+    let recorded = d["as_of"].as_str().unwrap().to_string();
+    let (_, again, _, _) = retention_plan(&fx.env(), &args(Some(&recorded)));
+    assert_eq!(again["plan_digest"], d["plan_digest"]);
+    assert_eq!(again["as_of"], d["as_of"]);
+}
